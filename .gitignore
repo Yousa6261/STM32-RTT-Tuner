@@ -1,0 +1,30 @@
+# build outputs (Keil / GCC / EIDE)
+*.o
+*.d
+*.crf
+*.lst
+*.map
+*.axf
+*.elf
+*.hex
+*.bin
+*.htm
+*.lnp
+*.dep
+*.uvguix.*
+*.bak
+build/
+Objects/
+Listings/
+**/MDK-ARM/DM_H7/
+
+# python / node
+__pycache__/
+*.pyc
+node_modules/
+
+# local backups and captured data
+_backup*/
+captures/
+recordings/
+*.log

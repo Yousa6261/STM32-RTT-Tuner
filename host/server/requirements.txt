@@ -1,0 +1,2 @@
+# 可选依赖 (若需要直接调用 JLinkARM.dll 请安装)
+pylink-square>=1.2.0

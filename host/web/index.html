@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>STM32 SEGGER RTT 实时调参控制台</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="dark-theme">
+
+  <!-- 顶部导航栏 -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="logo-icon">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <div>
+        <h1>STM32 RTT 实时调参系统</h1>
+        <span class="sub-title">SEGGER RTT Real-Time Tuner & ACK Monitor</span>
+      </div>
+    </div>
+
+    <!-- 连接控制栏 -->
+    <div class="connection-bar">
+      <div class="conn-inputs">
+        <select id="conn-mode" class="custom-select" title="选择连接方式">
+          <option value="mock">🎮 仿真模拟模式 (Mock)</option>
+          <option value="daplink" selected>🔗 DAP-Link 模式 (OpenOCD)</option>
+          <option value="stlink">🔗 ST-Link 模式 (OpenOCD)</option>
+          <option value="pylink">⚡ J-Link 直连模式 (SWD)</option>
+          <option value="telnet">🌐 Telnet 转发模式 (19021)</option>
+        </select>
+
+        <select id="chip-preset" class="custom-select" title="快速选择芯片型号">
+          <option value="h723" selected>🚀 STM32H723 (AXI SRAM: 0x24000000)</option>
+          <option value="f407">STM32F407 (0x20000000)</option>
+          <option value="f103">STM32F103 (0x20000000)</option>
+          <option value="g474">STM32G474 (0x20000000)</option>
+          <option value="f334">STM32F334 (0x20000000)</option>
+          <option value="custom">⚙️ 自定义输入...</option>
+        </select>
+
+        <div id="pylink-params" class="mode-extra-params hidden">
+          <input type="text" id="target-chip" placeholder="目标芯片 (如 STM32H723VG)" value="STM32H723VG" class="custom-input chip-input" title="目标芯片型号">
+        </div>
+
+        <div id="telnet-params" class="mode-extra-params hidden">
+          <input type="text" id="telnet-host" placeholder="IP" value="127.0.0.1" class="custom-input host-input">
+          <input type="number" id="telnet-port" placeholder="端口" value="19021" class="custom-input port-input">
+        </div>
+
+        <div id="openocd-params" class="mode-extra-params">
+          <input type="text" id="openocd-target" placeholder="目标 (如 stm32h7x)" value="stm32h7x" class="custom-input host-input" title="OpenOCD 芯片配置 (如 stm32h7x, stm32f4x, stm32f1x)">
+          <input type="text" id="openocd-ram" placeholder="RAM Base" value="0x24000000" class="custom-input port-input" title="RAM 起始地址 (H7 AXI SRAM 通常为 0x24000000)">
+          <select id="openocd-speed" class="custom-select" title="SWD 时钟。无线 DAPLink (WCH-LinkW 等) 实测 4MHz 会掉线，请选 1MHz">
+            <option value="4000" selected>SWD 4MHz (有线)</option>
+            <option value="2000">SWD 2MHz</option>
+            <option value="1000">SWD 1MHz (无线推荐)</option>
+            <option value="500">SWD 500kHz</option>
+          </select>
+        </div>
+      </div>
+
+      <button id="btn-connect" class="btn btn-primary">
+        <span class="btn-icon">⚡</span>
+        <span class="btn-text">连接目标</span>
+      </button>
+
+      <div class="status-indicator-badge">
+        <div id="status-led" class="status-led disconnected"></div>
+        <span id="status-text" class="status-text">未连接</span>
+      </div>
+
+      <div class="latency-badge" title="RTT 往返时延">
+        <span class="latency-icon">⏱️</span>
+        <span id="latency-val">-- ms</span>
+      </div>
+
+      <div class="vofa-badge" title="VOFA+ TCP 波形接口已就绪 (FireWater 协议)">
+        <span class="vofa-icon">📈</span>
+        <span class="vofa-text">VOFA+ :1347</span>
+      </div>
+
+      <button id="btn-ping" class="btn btn-secondary btn-icon-only" title="测试往返心跳 Ping">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- 主工作区 -->
+  <main class="main-container">
+    
+    <!-- 左侧：参数调节面板 -->
+    <section class="panels-left">
+
+      <!-- PID 算法专属调参卡片 -->
+      <div class="card param-card pid-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">🎛️</span>
+            <h3>PID 控制器核心参数</h3>
+          </div>
+          <div class="card-actions">
+            <label class="toggle-label" title="滑动条拖动时自动实时下发">
+              <input type="checkbox" id="auto-sync-toggle" checked>
+              <span class="toggle-slider"></span>
+              <span class="toggle-text">实时同步</span>
+            </label>
+            <button id="btn-refresh-all" class="btn btn-sm btn-secondary" title="向单片机请求全部参数最新值 ($GET:ALL)">
+              🔄 刷新全部
+            </button>
+          </div>
+        </div>
+
+        <div class="param-grid">
+          <!-- Kp -->
+          <div class="param-row" id="row-pid_kp">
+            <div class="param-info">
+              <span class="param-name">比例系数 Kp</span>
+              <span class="param-tag">float</span>
+              <span class="param-ack-badge" id="ack-pid_kp">已就绪</span>
+            </div>
+            <div class="param-control">
+              <input type="range" class="range-slider" id="slider-pid_kp" min="0" max="20" step="0.01" value="1.85">
+              <div class="num-box-group">
+                <input type="number" class="num-input" id="input-pid_kp" step="0.01" value="1.85">
+                <button class="btn btn-xs btn-step" data-target="pid_kp" data-step="-0.1">-0.1</button>
+                <button class="btn btn-xs btn-step" data-target="pid_kp" data-step="+0.1">+0.1</button>
+                <button class="btn btn-xs btn-send" data-target="pid_kp">发送</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Ki -->
+          <div class="param-row" id="row-pid_ki">
+            <div class="param-info">
+              <span class="param-name">积分系数 Ki</span>
+              <span class="param-tag">float</span>
+              <span class="param-ack-badge" id="ack-pid_ki">已就绪</span>
+            </div>
+            <div class="param-control">
+              <input type="range" class="range-slider" id="slider-pid_ki" min="0" max="5" step="0.005" value="0.12">
+              <div class="num-box-group">
+                <input type="number" class="num-input" id="input-pid_ki" step="0.005" value="0.12">
+                <button class="btn btn-xs btn-step" data-target="pid_ki" data-step="-0.01">-0.01</button>
+                <button class="btn btn-xs btn-step" data-target="pid_ki" data-step="+0.01">+0.01</button>
+                <button class="btn btn-xs btn-send" data-target="pid_ki">发送</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Kd -->
+          <div class="param-row" id="row-pid_kd">
+            <div class="param-info">
+              <span class="param-name">微分系数 Kd</span>
+              <span class="param-tag">float</span>
+              <span class="param-ack-badge" id="ack-pid_kd">已就绪</span>
+            </div>
+            <div class="param-control">
+              <input type="range" class="range-slider" id="slider-pid_kd" min="0" max="3" step="0.005" value="0.05">
+              <div class="num-box-group">
+                <input type="number" class="num-input" id="input-pid_kd" step="0.005" value="0.05">
+                <button class="btn btn-xs btn-step" data-target="pid_kd" data-step="-0.01">-0.01</button>
+                <button class="btn btn-xs btn-step" data-target="pid_kd" data-step="+0.01">+0.01</button>
+                <button class="btn btn-xs btn-send" data-target="pid_kd">发送</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- PID 预设与一键发送 -->
+          <div class="pid-presets-bar">
+            <span class="preset-label">预设参数组:</span>
+            <button class="btn btn-xs btn-preset" data-kp="1.2" data-ki="0.05" data-kd="0.02">平稳响应</button>
+            <button class="btn btn-xs btn-preset" data-kp="2.5" data-ki="0.25" data-kd="0.08">极速响应</button>
+            <button class="btn btn-xs btn-preset" data-kp="0.8" data-ki="0.01" data-kd="0.00">低刚度/防震</button>
+            <button id="btn-sync-all-pid" class="btn btn-sm btn-highlight">🚀 一键下发全部 PID</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 执行器与系统运行参数卡片 -->
+      <div class="card param-card system-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">⚙️</span>
+            <h3>电机与执行器设定</h3>
+          </div>
+        </div>
+
+        <div class="param-grid">
+          <!-- 目标转速 -->
+          <div class="param-row" id="row-target_speed">
+            <div class="param-info">
+              <span class="param-name">目标转速 Target Speed (RPM)</span>
+              <span class="param-tag">float</span>
+              <span class="param-ack-badge" id="ack-target_speed">已就绪</span>
+            </div>
+            <div class="param-control">
+              <input type="range" class="range-slider" id="slider-target_speed" min="-5000" max="5000" step="50" value="1500">
+              <div class="num-box-group">
+                <input type="number" class="num-input" id="input-target_speed" step="10" value="1500">
+                <button class="btn btn-xs btn-step" data-target="target_speed" data-step="-100">-100</button>
+                <button class="btn btn-xs btn-step" data-target="target_speed" data-step="+100">+100</button>
+                <button class="btn btn-xs btn-send" data-target="target_speed">发送</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 最大限制电流 -->
+          <div class="param-row" id="row-max_current">
+            <div class="param-info">
+              <span class="param-name">最大限流 Max Current (mA)</span>
+              <span class="param-tag">int32</span>
+              <span class="param-ack-badge" id="ack-max_current">已就绪</span>
+            </div>
+            <div class="param-control">
+              <input type="range" class="range-slider" id="slider-max_current" min="100" max="6000" step="100" value="3000">
+              <div class="num-box-group">
+                <input type="number" class="num-input" id="input-max_current" step="100" value="3000">
+                <button class="btn btn-xs btn-send" data-target="max_current">发送</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 模式选择与电机开关 -->
+          <div class="param-row-flex">
+            <!-- 运行模式 -->
+            <div class="sub-control-block">
+              <div class="sub-label">
+                <span>运行模式 (work_mode)</span>
+                <span class="param-ack-badge" id="ack-work_mode">已就绪</span>
+              </div>
+              <div class="mode-btn-group" id="mode-selector">
+                <button class="btn btn-mode active" data-mode="1">1. 速度模式</button>
+                <button class="btn btn-mode" data-mode="2">2. 位置模式</button>
+                <button class="btn btn-mode" data-mode="3">3. 扭矩模式</button>
+              </div>
+            </div>
+
+            <!-- 电机总使能开关 -->
+            <div class="sub-control-block motor-toggle-block">
+              <div class="sub-label">
+                <span>电机主使能 (motor_en)</span>
+                <span class="param-ack-badge" id="ack-motor_en">已就绪</span>
+              </div>
+              <label class="switch-huge">
+                <input type="checkbox" id="switch-motor_en">
+                <span class="switch-track">
+                  <span class="switch-handle"></span>
+                  <span class="switch-status-text">OFF</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- 动态自动发现的自注册参数列表 (从单片机动态获取) -->
+      <div class="card param-card dynamic-params-card" id="dynamic-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">📋</span>
+            <h3>单片机动态自注册参数表</h3>
+          </div>
+          <span class="badge-count" id="dynamic-param-count">已同步 0 项</span>
+        </div>
+        <div id="dynamic-params-container" class="param-grid">
+          <div class="empty-hint">点击顶部的【刷新全部】或连接单片机后自动获取所有注册变量...</div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- 右侧：实时波形监视与 RTT 终端交互 -->
+    <section class="panels-right">
+
+      <!-- 实时数据监视看板 (通用自适应看板: 支持数控电源 / 电机 / 传感器等各类项目) -->
+      <div class="card telemetry-card" id="telemetry-dashboard-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">📊</span>
+            <h3>实时数据监视看板 (Live Telemetry)</h3>
+          </div>
+          <div class="telemetry-header-meta">
+            <span class="tele-rate-badge" id="tele-rate-badge">0.0 Hz</span>
+            <button id="btn-clear-tele" class="btn btn-xs btn-secondary" title="清空并重置看板项">重置看板</button>
+          </div>
+        </div>
+        <div id="telemetry-grid" class="telemetry-grid">
+          <div class="empty-hint" id="tele-empty-hint">
+            等待接收单片机 <code>$DATA:</code> 遥测数据帧，或 RTT Channel 1 的 JustFloat 波形（各通道最新值会自动显示在这里）...
+            <div class="tele-hint-examples">
+              <span>⚡ 数控电源: <code>$DATA:v_out=12.05,i_out=2.30,p_out=27.7,temp=38.5,mode=CV</code></span>
+              <span>🚀 运动控制: <code>$DATA:target=1500,actual=1498.2,curr=1.25,temp=42.0</code></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 实时遥测波形卡片 -->
+      <div class="card chart-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">📈</span>
+            <h3>实时响应趋势波形 (Telemetry Waveform)</h3>
+          </div>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-dot target-dot"></span> 目标值 (Target)</span>
+            <span class="legend-item"><span class="legend-dot actual-dot"></span> 实际值 (Actual)</span>
+          </div>
+        </div>
+        <div class="chart-container">
+          <canvas id="telemetryCanvas" width="540" height="180"></canvas>
+        </div>
+      </div>
+
+      <!-- Ch1 高速波形 (JustFloat): 与 VOFA+ 同源 (两者都直接读 OpenOCD 19022) -->
+      <div class="card chart-card" id="wave-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">〰️</span>
+            <h3>Ch1 波形 (JustFloat，与 VOFA+ 同源)</h3>
+          </div>
+          <div class="wave-toolbar">
+            <span class="tele-rate-badge" id="wave-info" title="帧率 / 通道数 / 抽取倍数 / 重同步次数">未接收</span>
+            <select id="wave-scale" class="custom-select wave-select" title="分通道缩放: 每个通道按自身最小/最大值铺满高度, 适合量纲差别大的通道 (如 ±1 的正弦与 1500 的转速)">
+              <option value="per" selected>分通道缩放</option>
+              <option value="shared">共用纵轴</option>
+            </select>
+            <select id="wave-window" class="custom-select wave-select" title="显示时间窗">
+              <option value="1">1 s</option>
+              <option value="2" selected>2 s</option>
+              <option value="5">5 s</option>
+              <option value="10">10 s</option>
+            </select>
+            <button id="btn-wave-pause" class="btn btn-xs btn-secondary" title="冻结画面 (后台继续接收)">暂停</button>
+          </div>
+        </div>
+        <div id="wave-legend" class="wave-legend">
+          <span class="wave-empty-hint">等待 RTT Channel 1 的 JustFloat 数据 (固件 <code>RTT_Send_JustFloat*</code>)… 通道名可点击修改</span>
+        </div>
+        <div class="chart-container">
+          <canvas id="waveCanvas" width="540" height="220"></canvas>
+        </div>
+      </div>
+
+      <!-- RTT 交互式通信终端 -->
+      <div class="card terminal-card">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="card-icon">💻</span>
+            <h3>SEGGER RTT 通信终端</h3>
+          </div>
+          <div class="terminal-actions">
+            <label class="checkbox-inline">
+              <input type="checkbox" id="auto-scroll-check" checked>
+              <span>自动滚动</span>
+            </label>
+            <label class="checkbox-inline">
+              <input type="checkbox" id="filter-telemetry-check" checked>
+              <span>折叠波形帧</span>
+            </label>
+            <button id="btn-clear-term" class="btn btn-xs btn-secondary">清屏</button>
+          </div>
+        </div>
+
+        <!-- 终端输出区 -->
+        <div id="terminal-output" class="terminal-body">
+          <div class="log-line system">[SYSTEM] RTT 网页控制台已启动，等待连接...</div>
+        </div>
+
+        <!-- 终端手动命令发送行 -->
+        <div class="terminal-input-bar">
+          <div class="prompt-symbol">&gt;</div>
+          <input type="text" id="term-input" placeholder="手动输入 RTT 指令，如 $SET:pid_kp=2.3 或 $GET:ALL 并回车..." autocomplete="off">
+          <button id="btn-term-send" class="btn btn-sm btn-primary">发送</button>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

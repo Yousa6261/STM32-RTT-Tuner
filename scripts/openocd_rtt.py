@@ -100,7 +100,10 @@ def main(argv=None) -> int:
         print(f"unknown chip '{a.chip}'. Use --list."); return 2
     probe = a.probe if a.probe != "auto" else detect_probe(list_usb_devices())
     if probe is None:
-        print("No ST-Link / CMSIS-DAP debugger detected. Plug one in or pass --probe."); return 1
+        # Windows 11 中文版常将 CMSIS-DAP v1/v2 设备显示为 "USB 输入设备" 而非 "CMSIS-DAP"，
+        # WMI 名称匹配不到时默认按 cmsis-dap 启动，由 OpenOCD 直接读取 USB 硬件描述符识别。
+        print("[INFO] No explicit VID/Name match in WMI; defaulting to 'cmsis-dap' (OpenOCD will probe USB descriptors directly).")
+        probe = "cmsis-dap"
     khz = a.khz or (4000 if probe == "stlink" else 1000)
     if a.poll is not None and not (1 <= a.poll <= 1000):
         print("--poll must be 1..1000 ms"); return 2

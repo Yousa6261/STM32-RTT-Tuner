@@ -88,62 +88,64 @@ def compile_launchers(pkg_dir: Path):
     if not gcc or not stub.exists():
         step("WARNING: gcc not found; skipping .exe launcher compilation (.bat files still created).")
         return
-    step("Compiling native Windows launchers (RTT_Tuner.exe & RTT_Tuner_LAN_Share.exe) ...")
+    step("Compiling native Windows launchers (RTT_Tuner.exe, RTT_All_In_One.exe, RTT_Tuner_LAN_Share.exe) ...")
     subprocess.run([gcc, "-O2", "-s", str(stub), "-o", str(pkg_dir / "RTT_Tuner.exe")], check=True)
+    subprocess.run([gcc, "-O2", "-s", '-DEXTRA_ARGS="--openocd"', str(stub),
+                    "-o", str(pkg_dir / "RTT_All_In_One.exe")], check=True)
     subprocess.run([gcc, "-O2", "-s", '-DEXTRA_ARGS="--lan"', str(stub),
                     "-o", str(pkg_dir / "RTT_Tuner_LAN_Share.exe")], check=True)
 
 
 def write_batch_and_readme(pkg_dir: Path):
+    # 注意: Windows 11 中文版 cmd.exe 默认以 GBK (CP936) 按字节偏移逐行解析 .bat 文件；
+    # 若在 .bat 内直接写 UTF-8 中文或文件名含括号 ()，会导致 cmd.exe 语法解析错位或闪退！
+    # 因此所有 .bat 内容一律使用 100% 纯 ASCII，中文提示统一由 Python (run.py) 输出。
     bat1 = (
         "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
-        "title STM32 RTT v3.0 网页调参与时频分析台\r\n"
+        "title STM32 RTT v3.0 Web Param Tuner and Analyzer\r\n"
         "cd /d \"%~dp0\"\r\n"
         "set \"PATH=%~dp0runtime\\openocd\\bin;%PATH%\"\r\n"
         "if exist \"%~dp0runtime\\python\\python.exe\" (\r\n"
-        "    \"%~dp0runtime\\python\\python.exe\" host\\server\\run.py %*\r\n"
+        "    \"%~dp0runtime\\python\\python.exe\" \"%~dp0host\\server\\run.py\" %*\r\n"
         ") else (\r\n"
-        "    python host\\server\\run.py %*\r\n"
+        "    python \"%~dp0host\\server\\run.py\" %*\r\n"
         ")\r\n"
         "if errorlevel 1 pause\r\n"
     )
-    (pkg_dir / "1_启动网页调参台(含仿真模式).bat").write_bytes(bat1.encode("utf-8"))
+    (pkg_dir / "1_启动网页调参台.bat").write_bytes(bat1.encode("ascii"))
+    (pkg_dir / "start_web.bat").write_bytes(bat1.encode("ascii"))
 
     bat2 = (
         "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
-        "title STM32 RTT v3.0 一键全套启动 (OpenOCD + 网页调参台)\r\n"
+        "title STM32 RTT v3.0 All-In-One Launcher\r\n"
         "cd /d \"%~dp0\"\r\n"
         "set \"PATH=%~dp0runtime\\openocd\\bin;%PATH%\"\r\n"
         "set CHIP_ID=h723\r\n"
         "if not \"%~1\"==\"\" set CHIP_ID=%~1\r\n"
-        "echo [1/2] 正在启动三通道 OpenOCD RTT 服务 (芯片=%CHIP_ID%, 轮询=20ms)...\r\n"
         "if exist \"%~dp0runtime\\python\\python.exe\" (\r\n"
-        "    start \"OpenOCD RTT Server\" cmd /c \"\"%~dp0runtime\\python\\python.exe\" scripts\\openocd_rtt.py --chip %CHIP_ID% --poll 20 ^& pause\"\r\n"
-        "    \"%~dp0runtime\\python\\python.exe\" host\\server\\run.py\r\n"
+        "    \"%~dp0runtime\\python\\python.exe\" \"%~dp0host\\server\\run.py\" --openocd --chip %CHIP_ID%\r\n"
         ") else (\r\n"
-        "    start \"OpenOCD RTT Server\" cmd /c \"python scripts\\openocd_rtt.py --chip %CHIP_ID% --poll 20 ^& pause\"\r\n"
-        "    python host\\server\\run.py\r\n"
+        "    python \"%~dp0host\\server\\run.py\" --openocd --chip %CHIP_ID%\r\n"
         ")\r\n"
         "if errorlevel 1 pause\r\n"
     )
-    (pkg_dir / "2_一键启动全套(独立OpenOCD+网页).bat").write_bytes(bat2.encode("utf-8"))
+    (pkg_dir / "2_一键启动全套.bat").write_bytes(bat2.encode("ascii"))
+    (pkg_dir / "一键启动全套(OpenOCD+网页端).bat").write_bytes(bat2.encode("ascii"))
+    (pkg_dir / "start_all.bat").write_bytes(bat2.encode("ascii"))
 
     bat3 = (
         "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
-        "title STM32 RTT v3.0 局域网共享模式 (允许同Wi-Fi设备访问)\r\n"
+        "title STM32 RTT v3.0 LAN Share Mode\r\n"
         "cd /d \"%~dp0\"\r\n"
         "set \"PATH=%~dp0runtime\\openocd\\bin;%PATH%\"\r\n"
         "if exist \"%~dp0runtime\\python\\python.exe\" (\r\n"
-        "    \"%~dp0runtime\\python\\python.exe\" host\\server\\run.py --lan\r\n"
+        "    \"%~dp0runtime\\python\\python.exe\" \"%~dp0host\\server\\run.py\" --lan\r\n"
         ") else (\r\n"
-        "    python host\\server\\run.py --lan\r\n"
+        "    python \"%~dp0host\\server\\run.py\" --lan\r\n"
         ")\r\n"
         "if errorlevel 1 pause\r\n"
     )
-    (pkg_dir / "3_局域网共享模式(允许他人访问).bat").write_bytes(bat3.encode("utf-8"))
+    (pkg_dir / "3_局域网共享模式.bat").write_bytes(bat3.encode("ascii"))
 
     guide = """========================================================================
   STM32 SEGGER RTT v3.0 实时调参与时频分析工具链 (免安装绿色便携版)
@@ -245,6 +247,37 @@ def main():
 
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     step(f"SUCCESS! Portable package created: {zip_path} ({size_mb:.2f} MB)")
+
+    # 5. Also sync host/, scripts/, and pure-ASCII .bat launchers to F:\qwe\NEW_Project\DM_H7 if present
+    dm = Path(r"F:\qwe\NEW_Project\DM_H7")
+    if dm.exists():
+        step(f"Syncing self-contained host/ and .bat launchers into {dm} ...")
+        shutil.copytree(ROOT / "host", dm / "host", dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (dm / "scripts").mkdir(exist_ok=True)
+        shutil.copy2(ROOT / "scripts" / "openocd_rtt.py", dm / "scripts" / "openocd_rtt.py")
+        shutil.copy2(PKG_DIR / "RTT_Tuner.exe", dm / "RTT_Tuner.exe")
+        shutil.copy2(PKG_DIR / "RTT_All_In_One.exe", dm / "RTT_All_In_One.exe")
+        dm_bat_all = (
+            "@echo off\r\n"
+            "title STM32 RTT v3.0 Full Debug Suite Launcher\r\n"
+            "cd /d \"%~dp0\"\r\n"
+            "if exist \"%~dp0host\\server\\run.py\" (\r\n"
+            "    python \"%~dp0host\\server\\run.py\" --openocd %*\r\n"
+            ") else if exist \"F:\\.gemini\\RTTproject\\host\\server\\run.py\" (\r\n"
+            "    python \"F:\\.gemini\\RTTproject\\host\\server\\run.py\" --openocd %*\r\n"
+            ") else (\r\n"
+            "    echo [ERROR] Cannot find host\\server\\run.py\r\n"
+            "    pause\r\n"
+            ")\r\n"
+            "if errorlevel 1 pause\r\n"
+        ).encode("ascii")
+        for p in dm.glob("*.bat"):
+            if "一键启动" in p.name or p.name == "start_all.bat":
+                if "F103" in p.name:
+                    p.write_bytes(dm_bat_all.replace(b"--openocd %*", b"--openocd --chip f103c8"))
+                else:
+                    p.write_bytes(dm_bat_all)
 
 
 if __name__ == "__main__":

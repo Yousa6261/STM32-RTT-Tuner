@@ -34,13 +34,24 @@ try:
 except ImportError:
     HAS_PYLINK = False
 
-BASE_DIR = Path(__file__).resolve().parent
-WEB_DIR = BASE_DIR.parent / "web"
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+ROOT_DIR = BASE_DIR if hasattr(sys, "_MEIPASS") else BASE_DIR.parent.parent
+WEB_DIR = (BASE_DIR / "web") if (BASE_DIR / "web").exists() else (BASE_DIR.parent / "web")
 CHIPS_FILE = WEB_DIR / "chips.json"   # 芯片配置单一数据源 (网页预设与网关共用, v3 P0)
+ALLOW_LAN = False                     # --lan 开启时放行局域网私网 Origin 并监听 0.0.0.0
 
 sys.path.insert(0, str(BASE_DIR))
 from capture_proto import CaptureDecoder  # noqa: E402  (v3 P2: RTT Ch2 触发采集)
 from mock_capture import MockCapture      # noqa: E402
+
+
+def find_openocd_cmd() -> list:
+    """优先使用绿色包内置的 runtime/openocd, 其次使用系统 PATH 中的 openocd。"""
+    bundled = ROOT_DIR / "runtime" / "openocd" / "bin" / ("openocd.exe" if os.name == "nt" else "openocd")
+    scripts = ROOT_DIR / "runtime" / "openocd" / "openocd" / "scripts"
+    if bundled.exists():
+        return [str(bundled), "-s", str(scripts)] if scripts.exists() else [str(bundled)]
+    return ["openocd"]
 
 # 连接参数校验 (v3 P0 安全修复): openocd_target / openocd_ram 会被拼进 OpenOCD 的 Tcl 命令 (-c "..."),
 # 未校验时可注入任意 Tcl 语句。只接受下列格式。
@@ -64,17 +75,27 @@ def load_chips() -> Dict[str, dict]:
         return {}
 
 
-def is_local_origin(origin: Optional[str]) -> bool:
+def is_local_origin(origin: Optional[str], allow_lan: Optional[bool] = None) -> bool:
     """WebSocket 跨站劫持防护 (v3 P0 安全修复)。
     浏览器对 WebSocket 不做同源限制: 用户浏览器中打开的任意网页都能连 ws://127.0.0.1:8765 并下发 $SET 指令。
     浏览器发起的握手一定带 Origin 头, 因此: 无 Origin (Python/VOFA 等非浏览器客户端) 放行;
-    有 Origin 时只接受 http(s)://127.0.0.1 / localhost / [::1] (任意端口)。"""
+    有 Origin 时默认只接受 http(s)://127.0.0.1 / localhost / [::1] (任意端口);
+    若开启 --lan (局域网共享模式), 额外放行 RFC1918 私网 IPv4 (10.x / 192.168.x / 172.16-31.x)。"""
     if origin is None:
         return True
     try:
+        import ipaddress
         from urllib.parse import urlsplit
         u = urlsplit(origin.strip())
-        return u.scheme in ("http", "https") and (u.hostname or "") in ("127.0.0.1", "localhost", "::1")
+        if u.scheme not in ("http", "https"):
+            return False
+        host = (u.hostname or "").lower()
+        if host in ("127.0.0.1", "localhost", "::1"):
+            return True
+        if allow_lan if allow_lan is not None else ALLOW_LAN:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_private or ip.is_link_local
+        return False
     except ValueError:
         return False
 
@@ -793,7 +814,7 @@ class RTTManager:
 
             interface = "stlink" if mode == "stlink" else "cmsis-dap"
             cmd = [
-                "openocd",
+                *find_openocd_cmd(),
                 "-f", f"interface/{interface}.cfg",
                 # 修复(B2a): stlink.cfg 不显式选择传输时默认 JTAG, SWD 接线必须显式声明
                 "-c", "transport select swd",
@@ -1441,20 +1462,37 @@ def silence_connection_reset(loop, context):
     loop.default_exception_handler(context)
 
 
-async def main():
+def _get_lan_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+async def main(allow_lan: bool = False):
+    global ALLOW_LAN
+    if allow_lan or "--lan" in sys.argv:
+        ALLOW_LAN = True
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(silence_connection_reset)
-    # 安全修复 (H3b): 默认仅监听本机回环地址。网关可下发电机控制指令且静态服务
-    # 曾存在路径穿越风险，不应默认暴露给局域网。如需手机/局域网调参，将 host
-    # 改为 "0.0.0.0" 并确保网络环境可信。
-    server = AppServer(host="127.0.0.1", port=8765, vofa_port=1347, vofa_text_port=1348)
+    # 安全修复 (H3b): 默认仅监听本机回环地址；传入 --lan 时开启局域网同伴共享模式。
+    bind_host = "0.0.0.0" if ALLOW_LAN else "127.0.0.1"
+    server = AppServer(host=bind_host, port=8765, vofa_port=1347, vofa_text_port=1348)
     async_srv = await asyncio.start_server(server.handle_client, server.host, server.port)
     vofa_srv = await asyncio.start_server(server.handle_vofa_client, server.host, server.vofa_port)
     vofa_text_srv = await asyncio.start_server(server.handle_vofa_text_client, server.host, server.vofa_text_port)
     print("=" * 68)
     print("  [OK] STM32 RTT 多通道物理隔离 Web & VOFA+ 网关就绪!")
-    print(f"  * Web 调参控制台:    http://127.0.0.1:{server.port}")
+    print(f"  * 本机 Web 控制台:   http://127.0.0.1:{server.port}")
+    if ALLOW_LAN:
+        print(f"  * 局域网同伴访问:    http://{_get_lan_ip()}:{server.port} (同一 Wi-Fi/局域网设备可直接打开)")
     print(f"  * RTT Channel 0:     127.0.0.1:19021 (命令行/调参终端, Web UI 专用)")
+    print(f"  * RTT Channel 1:     127.0.0.1:19022 (高速连续波形 JustFloat)")
+    print(f"  * RTT Channel 2:     127.0.0.1:19023 (片上全速触发采集)")
     print(f"  * VOFA+ JustFloat:   127.0.0.1:{server.vofa_port} (网关转发 Ch1 波形, 与网页同源; 或直连 19022)")
     print(f"  * VOFA+ FireWater:   127.0.0.1:{server.vofa_text_port} (仅 $DATA 文本)")
     print("  * 硬件连接支持:      DAP-Link / ST-Link / J-Link / Telnet / Mock 仿真")

@@ -53,14 +53,23 @@ def detect_probe(devs):
     return None
 
 
-def build_cmd(chip: dict, probe: str, khz: int, poll_ms, ch2: bool):
+def find_openocd_base():
+    bundled = ROOT / "runtime" / "openocd" / "bin" / ("openocd.exe" if sys.platform == "win32" else "openocd")
+    scripts = ROOT / "runtime" / "openocd" / "openocd" / "scripts"
+    if bundled.exists():
+        return [str(bundled), "-s", str(scripts)] if scripts.exists() else [str(bundled)]
+    return ["openocd"]
+
+
+def build_cmd(chip: dict, probe: str, khz: int, poll_ms, ch2: bool, openocd_base=None):
     if probe == "stlink":
         iface = ["-f", "interface/stlink.cfg"]
     elif probe == "wch-dap":
         iface = ["-f", "interface/cmsis-dap.cfg", "-c", "cmsis-dap vid_pid 0x1a86 0x8012 0x1a86 0x8011"]
     else:
         iface = ["-f", "interface/cmsis-dap.cfg"]
-    cmd = ["openocd", *iface, "-c", "transport select swd",
+    base = openocd_base if openocd_base is not None else ["openocd"]
+    cmd = [*base, *iface, "-c", "transport select swd",
            "-f", f"target/{chip['openocd_target']}.cfg", "-c", f"adapter speed {khz}", "-c", "init",
            "-c", f"rtt setup {chip['ram_base']} {chip['rtt_scan_size']} {{SEGGER RTT}}", "-c", "rtt start",
            "-c", "rtt server start 19021 0", "-c", "rtt server start 19022 1"]
@@ -95,7 +104,7 @@ def main(argv=None) -> int:
     khz = a.khz or (4000 if probe == "stlink" else 1000)
     if a.poll is not None and not (1 <= a.poll <= 1000):
         print("--poll must be 1..1000 ms"); return 2
-    cmd = build_cmd(chips[a.chip], probe, khz, a.poll, not a.no_ch2)
+    cmd = build_cmd(chips[a.chip], probe, khz, a.poll, not a.no_ch2, openocd_base=None if a.dry_run else find_openocd_base())
     print(f"chip={a.chip} probe={probe} swd={khz}kHz poll={a.poll or 100}ms ch2={'on' if not a.no_ch2 else 'off'}")
     print(" ".join(f'"{x}"' if " " in x else x for x in cmd))
     if a.dry_run:

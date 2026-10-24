@@ -544,6 +544,45 @@ except (OSError, ValueError):
 
 ---
 
+## 2026-10-24 · 第 13 批（v3 P0）：建立版本库 `F:\.gemini\RTTproject` + 芯片配置表 + 两项安全修复
+
+> 自本批起，**本仓库为正本**；修改记录以 `docs/MODIFICATION_LOG.md` 为准，DM_H7 下保留同步副本。
+> 原目录 `...\antigravity\scratch\stm32-rtt-param-tuner` 停用（未删除）。
+
+### FIX-027 ✅ 🟡 仓库迁移
+
+- **结构**：`firmware/rtt_core`（单片机侧源码）、`firmware/examples`、`host/server`、`host/web`、`scripts`、`TESTs`（含 `hw/` 硬件测试）、`docs`。
+- **固件模板来源**：以 DM_H7 内的副本为准。工具目录内的副本缺少 FIX-018 的修改（5 个文件不一致，且没有 `rtt_telemetry.*`），**已过时，未采用**。
+- **测试**：全部改为相对仓库路径；`python TESTs/run_all.py` 一键运行（会自动收录新增的 `test_*.py` / `test_*.js`）。
+- **同步脚本**：`scripts/sync_to_project.py`。默认只列出差异；加 `--apply` 才复制，覆盖前先备份；工程中独有的文件只报告、不删除。首次比对：10 个文件一致，0 个需同步。
+- **git**：`.gitattributes` 设为 `* -text`，保持字节原样（bat 文件必须是 CRLF）。仓库内使用占位身份 `RTTproject Dev`，未修改全局 git 配置。
+
+### FIX-028 ✅ 🔴 [S1] WebSocket 跨站劫持（CSWSH）
+
+- **问题**：网关的 WebSocket 握手不检查 `Origin`。浏览器对 WebSocket 不做同源限制，用户浏览器中打开的任意网页都能连接 `ws://127.0.0.1:8765` 并发送 `send_rtt`，例如 `$SET:motor_en=1`。FIX-003 只是把监听地址限制为本机，无法防御这种来自浏览器内部的攻击。
+- **修复**：`is_local_origin()`。带 `Origin` 头时只接受 `http(s)://127.0.0.1 / localhost / [::1]`（端口不限），其他一律返回 403；不带 `Origin` 的非浏览器客户端（Python 测试、工具）放行。
+- **验证**：真实握手测试：恶意来源 → 403；本机页面 → 101；无 Origin → 101。
+
+### FIX-029 ✅ 🔴 [S2] OpenOCD Tcl 命令注入
+
+- **问题**：网页传来的 `openocd_target` / `openocd_ram` 未经校验就拼进 `-c "rtt setup {ram} ..."` 等 Tcl 命令，可注入任意 Tcl 语句。
+- **修复**：`validate_connect_args()` 校验全部连接参数：target 只允许 `^[a-z0-9_]{2,32}$`，RAM 必须为 `^0x[0-9a-fA-F]{1,8}$`，并检查 SWD 时钟、端口、主机名、模式、芯片 id 的格式与范围。不合法时直接拒绝，不会启动 OpenOCD。
+
+### FIX-030 ✅ 🟡 芯片配置表 `host/web/chips.json`
+
+- **内容**：共 10 个型号：H723、F407、F427、F103C8（以上为用户手头的板子，网页中以 ★ 标记），以及 F103xE、G474、F334、G071、G0B1、G030。
+- **共用方式**：网页从该表生成芯片下拉框；网关按芯片 id 取 RTT 扫描范围。修复了旧逻辑中 F407 与 F427 同为 `stm32f4x`、扫描范围只能取同一个值的问题。芯片与 target 不一致时，回退到原来的按系列推断。
+- **新启动器** `scripts/openocd_rtt.py`（以及 `run_openocd.bat` 包装）：
+  - 用法：`--chip/--khz/--poll/--probe/--no-ch2/--list/--dry-run`；
+  - 自动识别调试器：ST-Link > WCH > 任意 CMSIS-DAP；
+  - 默认额外开启 **19023 端口（RTT Ch2，供触发采集使用）**。
+  - 原来的三个 bat 移到 `scripts/legacy/`。
+- **验证**：
+  - `test_p0_chips_security.py` 51/51；`run_all` 9/9；
+  - 硬件冒烟测试（H723 + 无线 DAPLink，`launcher_smoke.py`）：19021、19022、19023 均可连接，PING 19.3 ms，OpenOCD 无错误。当前固件未配置 Ch2，开启 19023 也不报错。
+
+---
+
 ## 待办清单 (源自 2026-09-12 深度审查，按优先级排序)
 
 ### 🔴 接入电机控制前必修

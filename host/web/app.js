@@ -85,25 +85,47 @@
   }
 
   // ================= 芯片预设切换 =================
+  // v3 P0: 预设来自 chips.json (与网关共用的单一数据源)。加载失败 (如直接用 file:// 打开) 时
+  // 保留 index.html 中的静态选项, 并使用下方最小内置表。
+  const chipProfiles = {
+    h723: { part: 'STM32H723VG', openocd_target: 'stm32h7x', ram_base: '0x24000000' }
+  };
+
+  function applyChipProfile(id) {
+    const cfg = chipProfiles[id];
+    if (!cfg) return;
+    if (els.targetChip) els.targetChip.value = cfg.part;
+    if (els.openocdTarget) els.openocdTarget.value = cfg.openocd_target;
+    if (els.openocdRam) els.openocdRam.value = cfg.ram_base;
+    const extra = cfg.rtt_scan_size ? `, 扫描 ${cfg.rtt_scan_size}` : '';
+    logTerminal('system', `已切换芯片预设: ${cfg.part} (OpenOCD: ${cfg.openocd_target}, RAM: ${cfg.ram_base}${extra})${cfg.note ? ' — ' + cfg.note : ''}`);
+  }
 
   function setupChipPresets() {
     if (!els.chipPreset) return;
-    const presets = {
-      h723: { targetChip: 'STM32H723VG', openocdTarget: 'stm32h7x', openocdRam: '0x24000000' },
-      f407: { targetChip: 'STM32F407ZG', openocdTarget: 'stm32f4x', openocdRam: '0x20000000' },
-      f103: { targetChip: 'STM32F103C8', openocdTarget: 'stm32f1x', openocdRam: '0x20000000' },
-      g474: { targetChip: 'STM32G474RB', openocdTarget: 'stm32g4x', openocdRam: '0x20000000' },
-      f334: { targetChip: 'STM32F334C8', openocdTarget: 'stm32f3x', openocdRam: '0x20000000' }
-    };
-    els.chipPreset.addEventListener('change', (e) => {
-      const cfg = presets[e.target.value];
-      if (cfg) {
-        if (els.targetChip) els.targetChip.value = cfg.targetChip;
-        if (els.openocdTarget) els.openocdTarget.value = cfg.openocdTarget;
-        if (els.openocdRam) els.openocdRam.value = cfg.openocdRam;
-        logTerminal('system', `已切换芯片预设: ${cfg.targetChip} (OpenOCD: ${cfg.openocdTarget}, RAM: ${cfg.openocdRam})`);
-      }
-    });
+    els.chipPreset.addEventListener('change', (e) => applyChipProfile(e.target.value));
+    fetch('chips.json', { cache: 'no-cache' })
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then(data => {
+        const list = Array.isArray(data.chips) ? data.chips : [];
+        if (!list.length) return;
+        const prev = els.chipPreset.value;
+        els.chipPreset.textContent = '';
+        list.forEach(c => {
+          chipProfiles[c.id] = c;
+          const opt = document.createElement('option');
+          opt.value = c.id;
+          opt.textContent = c.board ? `${c.label} ★` : c.label;   // ★ = 用户手头有开发板
+          opt.title = c.note || '';
+          els.chipPreset.appendChild(opt);
+        });
+        const custom = document.createElement('option');
+        custom.value = 'custom';
+        custom.textContent = '自定义...';
+        els.chipPreset.appendChild(custom);
+        els.chipPreset.value = chipProfiles[prev] ? prev : list[0].id;
+      })
+      .catch(err => logTerminal('system', `chips.json 加载失败, 使用内置预设 (${err.message})`));
   }
 
   // ================= 连接模式切换 =================
@@ -303,7 +325,8 @@
         port: port,
         speed: ocdSpeed,
         openocd_target: ocdTarget,
-        openocd_ram: ocdRam
+        openocd_ram: ocdRam,
+        chip: els.chipPreset ? els.chipPreset.value : null
       });
     }
   }

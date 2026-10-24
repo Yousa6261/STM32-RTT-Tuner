@@ -10,6 +10,7 @@ STM32 SEGGER RTT Web Bridge Server
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -35,6 +36,43 @@ except ImportError:
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR.parent / "web"
+CHIPS_FILE = WEB_DIR / "chips.json"   # 芯片配置单一数据源 (网页预设与网关共用, v3 P0)
+
+# 连接参数校验 (v3 P0 安全修复): openocd_target / openocd_ram 会被拼进 OpenOCD 的 Tcl 命令 (-c "..."),
+# 未校验时可注入任意 Tcl 语句。只接受下列格式。
+RE_OCD_TARGET = re.compile(r"^[a-z0-9_]{2,32}$")
+RE_HEX_ADDR = re.compile(r"^0x[0-9a-fA-F]{1,8}$")
+RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
+RE_CHIP_ID = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+def load_chips() -> Dict[str, dict]:
+    """读取 chips.json, 返回 {id: profile}; 文件缺失或格式错误时返回空字典 (回退到按系列推断)。"""
+    try:
+        data = json.loads(CHIPS_FILE.read_text(encoding="utf-8"))
+        out = {}
+        for c in data.get("chips", []):
+            if (RE_CHIP_ID.match(str(c.get("id", ""))) and RE_OCD_TARGET.match(str(c.get("openocd_target", "")))
+                    and RE_HEX_ADDR.match(str(c.get("ram_base", ""))) and RE_HEX_ADDR.match(str(c.get("rtt_scan_size", "")))):
+                out[c["id"]] = c
+        return out
+    except (OSError, ValueError):
+        return {}
+
+
+def is_local_origin(origin: Optional[str]) -> bool:
+    """WebSocket 跨站劫持防护 (v3 P0 安全修复)。
+    浏览器对 WebSocket 不做同源限制: 用户浏览器中打开的任意网页都能连 ws://127.0.0.1:8765 并下发 $SET 指令。
+    浏览器发起的握手一定带 Origin 头, 因此: 无 Origin (Python/VOFA 等非浏览器客户端) 放行;
+    有 Origin 时只接受 http(s)://127.0.0.1 / localhost / [::1] (任意端口)。"""
+    if origin is None:
+        return True
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(origin.strip())
+        return u.scheme in ("http", "https") and (u.hostname or "") in ("127.0.0.1", "localhost", "::1")
+    except ValueError:
+        return False
 
 # Windows asyncio Proactor socket.shutdown 异常静音修复 (WinError 10054)
 if sys.platform == 'win32':
@@ -394,6 +432,7 @@ class RTTManager:
         self.port = 19021
         self.openocd_target = "stm32h7x"
         self.openocd_ram = "0x24000000"
+        self.chip_id: Optional[str] = None   # chips.json 中的芯片 id (v3 P0)
 
         self.jlink: Optional[Any] = None
         self.socket: Optional[socket.socket] = None
@@ -526,11 +565,14 @@ class RTTManager:
             await self._flush_wave(frames, est.fps(), dec)
 
     def _rtt_scan_size(self) -> str:
-        """按芯片系列返回安全的 RTT 控制块扫描范围 (防止越过 SRAM 边界触发 Bus Fault)"""
+        """按芯片返回安全的 RTT 控制块扫描范围 (防止越过 SRAM 边界触发 Bus Fault)"""
         # FIX-018: OpenOCD 按 1KB 分块扫描, 命中即返回 (src/target/rtt.c); 只有【找不到控制块】时
         # (固件未运行/未集成 RTT) 才会读到 address+size, 越过 SRAM 末端则报读错误而非"未找到".
-        # 范围偏大 -> 仅影响失败时的报错形式; 范围偏小 -> 控制块在范围外时正常固件也连不上.
-        # 因此只对型号确定的系列收紧 (F334x8 = 12KB), 其余保持原值.
+        # v3 P0: 优先使用 chips.json 中该芯片的值 (同一 OpenOCD target 下不同型号 SRAM 不同, 如 F407/F427);
+        # 仅当芯片未知或与 OpenOCD target 不一致时, 回退到按系列推断。
+        prof = load_chips().get(self.chip_id or "")
+        if prof and prof["openocd_target"] == self.openocd_target.lower():
+            return prof["rtt_scan_size"]
         t = self.openocd_target.lower()
         if "f1" in t:
             return "0x10000"   # STM32F103: 按大容量型号 64KB (C8 仅 20KB, 但命中即停, 见上)
@@ -540,6 +582,8 @@ class RTTManager:
             return "0x20000"   # STM32F407/F207: SRAM 128KB
         if "g4" in t:
             return "0x18000"   # STM32G474: SRAM1+SRAM2 96KB
+        if "g0" in t:
+            return "0x2000"    # STM32G0: 最小型号 8KB (更大型号请在网页选择具体芯片)
         return "0x40000"       # STM32H7 AXI SRAM (沿用原值; 控制块位于 RAM 头部即命中)
 
     def get_status(self) -> dict:
@@ -552,12 +596,37 @@ class RTTManager:
             "port": self.port,
             "openocd_target": self.openocd_target,
             "openocd_ram": self.openocd_ram,
+            "chip": self.chip_id,
             "has_pylink": HAS_PYLINK
         }
 
+    @staticmethod
+    def validate_connect_args(mode: str, speed, host: str, port, openocd_target: str, openocd_ram: str,
+                              chip: Optional[str]) -> Optional[str]:
+        """返回错误信息; 参数合法时返回 None"""
+        if mode not in ("mock", "telnet", "pylink", "stlink", "daplink"):
+            return f"未知连接模式: {mode!r}"
+        if not isinstance(speed, int) or not (50 <= speed <= 50000):
+            return f"SWD 时钟超出范围 (50~50000 kHz): {speed!r}"
+        if not isinstance(port, int) or not (1 <= port <= 65534):
+            return f"端口超出范围: {port!r}"
+        if not RE_HOSTNAME.match(str(host)):
+            return f"主机名格式不合法: {host!r}"
+        if not RE_OCD_TARGET.match(str(openocd_target)):
+            return f"OpenOCD target 格式不合法 (只允许小写字母/数字/下划线): {openocd_target!r}"
+        if not RE_HEX_ADDR.match(str(openocd_ram)):
+            return f"RAM 地址格式不合法 (应为 0x 开头的十六进制): {openocd_ram!r}"
+        if chip is not None and not RE_CHIP_ID.match(str(chip)):
+            return f"芯片 id 格式不合法: {chip!r}"
+        return None
+
     async def connect(self, mode: str = "mock", target: str = "STM32H723VG", 
                       speed: int = 4000, host: str = "127.0.0.1", port: int = 19021,
-                      openocd_target: str = "stm32h7x", openocd_ram: str = "0x24000000") -> tuple[bool, str]:
+                      openocd_target: str = "stm32h7x", openocd_ram: str = "0x24000000",
+                      chip: Optional[str] = None) -> tuple[bool, str]:
+        err = self.validate_connect_args(mode, speed, host, port, openocd_target, openocd_ram, chip)
+        if err:
+            return False, err
         await self.disconnect()
         self.mode = mode
         self.target_device = target
@@ -566,6 +635,7 @@ class RTTManager:
         self.port = port
         self.openocd_target = openocd_target
         self.openocd_ram = openocd_ram
+        self.chip_id = chip
 
         if mode == "mock":
             self.connected = True
@@ -1133,6 +1203,11 @@ class AppServer:
                 if not sec_key:
                     writer.close()
                     return
+                if not is_local_origin(headers.get('origin')):
+                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    await writer.drain()
+                    writer.close()
+                    return
 
                 resp = make_ws_handshake_response(sec_key)
                 writer.write(resp)
@@ -1213,15 +1288,20 @@ class AppServer:
                 await ws.send_json(self.rtt.get_status())
 
             elif action == "connect":
-                mode = req.get("mode", "mock")
-                target = req.get("target", "STM32H723VG")
-                speed = int(req.get("speed", 4000))
-                host = req.get("host", "127.0.0.1")
-                port = int(req.get("port", 19021))
-                openocd_target = req.get("openocd_target", "stm32h7x")
-                openocd_ram = req.get("openocd_ram", "0x24000000")
-                
-                ok, msg = await self.rtt.connect(mode, target, speed, host, port, openocd_target, openocd_ram)
+                mode = str(req.get("mode", "mock"))
+                target = str(req.get("target", "STM32H723VG"))[:32]
+                try:
+                    speed = int(req.get("speed", 4000))
+                    port = int(req.get("port", 19021))
+                except (TypeError, ValueError):
+                    speed, port = None, None
+                host = str(req.get("host", "127.0.0.1"))
+                openocd_target = str(req.get("openocd_target", "stm32h7x"))
+                openocd_ram = str(req.get("openocd_ram", "0x24000000"))
+                chip = req.get("chip")
+                chip = str(chip) if chip not in (None, "", "custom") else None
+
+                ok, msg = await self.rtt.connect(mode, target, speed, host, port, openocd_target, openocd_ram, chip)
                 await self.broadcast({
                     "type": "connect_result",
                     "success": ok,

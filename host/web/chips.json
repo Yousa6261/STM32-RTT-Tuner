@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "_comment": "芯片配置单一数据源 (网页预设 / 网关 RTT 扫描范围 / scripts/openocd_rtt.py 共用)。rtt_scan_size: OpenOCD 按 1KB 分块扫描控制块, 命中即停; 仅在找不到控制块时才会读到 ram_base+size, 因此不得超过该芯片 0x20000000 起连续 SRAM 的末端。",
+  "chips": [
+    {"id": "h723",   "label": "STM32H723 (AXI SRAM 0x24000000)", "part": "STM32H723VG",  "core": "cortex-m7",  "openocd_target": "stm32h7x", "ram_base": "0x24000000", "rtt_scan_size": "0x40000", "sram_kb": 564, "board": true,  "note": "AXI SRAM 320KB; 控制块通常位于头部"},
+    {"id": "f407",   "label": "STM32F407 (0x20000000)",          "part": "STM32F407ZG",  "core": "cortex-m4f", "openocd_target": "stm32f4x", "ram_base": "0x20000000", "rtt_scan_size": "0x20000", "sram_kb": 192, "board": true,  "note": "SRAM1+SRAM2 128KB 连续; CCM 64KB 位于 0x10000000 不扫描"},
+    {"id": "f427",   "label": "STM32F427 (0x20000000)",          "part": "STM32F427VI",  "core": "cortex-m4f", "openocd_target": "stm32f4x", "ram_base": "0x20000000", "rtt_scan_size": "0x30000", "sram_kb": 256, "board": true,  "note": "SRAM1+2+3 192KB 连续; CCM 64KB 不扫描"},
+    {"id": "f103c8", "label": "STM32F103C8 (0x20000000)",        "part": "STM32F103C8",  "core": "cortex-m3",  "openocd_target": "stm32f1x", "ram_base": "0x20000000", "rtt_scan_size": "0x5000",  "sram_kb": 20,  "board": true,  "note": "SRAM 20KB; 无 FPU; 建议 BUFFER_SIZE_UP=512, RTT_WAVEFORM_DEFAULT_BUF_SIZE=1024"},
+    {"id": "f103xe", "label": "STM32F103xE (0x20000000)",        "part": "STM32F103ZE",  "core": "cortex-m3",  "openocd_target": "stm32f1x", "ram_base": "0x20000000", "rtt_scan_size": "0x10000", "sram_kb": 64,  "board": false, "note": "大容量型号 SRAM 64KB"},
+    {"id": "g474",   "label": "STM32G474 (0x20000000)",          "part": "STM32G474RB",  "core": "cortex-m4f", "openocd_target": "stm32g4x", "ram_base": "0x20000000", "rtt_scan_size": "0x18000", "sram_kb": 128, "board": false, "note": "SRAM1+SRAM2 96KB; CCM 32KB 另映射于 0x10000000"},
+    {"id": "f334",   "label": "STM32F334 (0x20000000)",          "part": "STM32F334C8",  "core": "cortex-m4f", "openocd_target": "stm32f3x", "ram_base": "0x20000000", "rtt_scan_size": "0x3000",  "sram_kb": 12,  "board": false, "note": "SRAM 12KB; 建议 BUFFER_SIZE_UP=512"},
+    {"id": "g071",   "label": "STM32G071 (0x20000000)",          "part": "STM32G071RB",  "core": "cortex-m0+", "openocd_target": "stm32g0x", "ram_base": "0x20000000", "rtt_scan_size": "0x9000",  "sram_kb": 36,  "board": false, "note": "Cortex-M0+: 不支持非对齐访问"},
+    {"id": "g0b1",   "label": "STM32G0B1 (0x20000000)",          "part": "STM32G0B1RE",  "core": "cortex-m0+", "openocd_target": "stm32g0x", "ram_base": "0x20000000", "rtt_scan_size": "0x24000", "sram_kb": 144, "board": false, "note": "Cortex-M0+"},
+    {"id": "g030",   "label": "STM32G030 (0x20000000)",          "part": "STM32G030F6",  "core": "cortex-m0+", "openocd_target": "stm32g0x", "ram_base": "0x20000000", "rtt_scan_size": "0x2000",  "sram_kb": 8,   "board": false, "note": "SRAM 8KB: 需大幅缩小 RTT 缓冲, 不建议启用触发采集"}
+  ]
+}

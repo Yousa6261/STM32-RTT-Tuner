@@ -210,6 +210,9 @@
         case 'connect_result':
           logTerminal(msg.success ? 'system' : 'ack-err', msg.message);
           if (msg.status) updateConnectionStatus(msg.status);
+          if (msg.success && window.RTTCapturePanel && typeof window.RTTCapturePanel.onConnected === 'function') {
+            window.RTTCapturePanel.onConnected();
+          }
           break;
 
         case 'rtt_tx':
@@ -260,6 +263,24 @@
         case 'wave_status':
           logTerminal(msg.connected ? 'system' : 'ack-err', `[Ch1] ${msg.message}`);
           if (!msg.connected && els.waveInfo) els.waveInfo.textContent = 'Ch1 未连接';
+          break;
+
+        case 'capture':
+          if (window.RTTCapturePanel && typeof window.RTTCapturePanel.onCapture === 'function') {
+            window.RTTCapturePanel.onCapture(msg);
+          }
+          break;
+
+        case 'capture_status':
+          if (window.RTTCapturePanel && typeof window.RTTCapturePanel.onStatus === 'function') {
+            window.RTTCapturePanel.onStatus(msg);
+          }
+          break;
+
+        case 'cap_ack':
+          if (window.RTTCapturePanel && typeof window.RTTCapturePanel.onAck === 'function') {
+            window.RTTCapturePanel.onAck(msg);
+          }
           break;
       }
     } catch (e) {
@@ -1093,6 +1114,38 @@
       wave.paused = !wave.paused;
       btnPause.textContent = wave.paused ? '继续' : '暂停';
     });
+    const btnWaveAnalyze = document.getElementById('btn-wave-analyze');
+    if (btnWaveAnalyze) btnWaveAnalyze.addEventListener('click', () => {
+      if (!wave.nch || !wave.ch[0] || wave.ch[0].length < 4) {
+        logTerminal('system', '⚠️ Ch1 尚无足够波形数据可供分析');
+        return;
+      }
+      if (window.RTTCapturePanel && typeof window.RTTCapturePanel.importCh1Snapshot === 'function') {
+        window.RTTCapturePanel.importCh1Snapshot();
+      }
+    });
+    const btnWaveCsv = document.getElementById('btn-wave-csv');
+    if (btnWaveCsv) btnWaveCsv.addEventListener('click', () => {
+      if (!wave.nch || !wave.ch[0] || !wave.ch[0].length) {
+        logTerminal('system', '⚠️ Ch1 尚无波形数据可导出');
+        return;
+      }
+      const fs = Math.round(wave.displayRate || wave.fps || 100);
+      const snap = {
+        cap_id: 0, sample_hz: fs, trigger_index: 0, fmt_name: 'f32',
+        names: wave.names.slice(0, wave.nch),
+        channels: wave.ch.slice(0, wave.nch).map(a => a.slice())
+      };
+      if (window.RTTAnalysis && typeof window.RTTAnalysis.toCSV === 'function') {
+        const csv = window.RTTAnalysis.toCSV(snap, snap.names);
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `ch1_wave_${Date.now()}.csv`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      }
+    });
     requestAnimationFrame(drawWave);
   }
 
@@ -1366,6 +1419,20 @@
       els.termOutput.removeChild(els.termOutput.firstChild);
     }
   }
+
+  // 暴露最小桥接接口供 capture_panel.js 与自动化测试调用
+  window.RTTApp = {
+    sendRtt: sendRttCommand,
+    sendJson: sendJson,
+    logTerminal: logTerminal,
+    isConnected: () => isConnected,
+    getCh1Snapshot: () => ({
+      sample_hz: Math.max(1, Math.round(wave.displayRate || wave.fps || 100)),
+      nch: wave.nch,
+      names: wave.names.slice(0, wave.nch),
+      channels: wave.ch.slice(0, wave.nch).map(a => a.slice())
+    })
+  };
 
   // 页面加载完成后启动
   window.addEventListener('DOMContentLoaded', init);

@@ -87,6 +87,14 @@ bool RTT_Param_Register(const char *name, void *var_ptr, ParamType_t type,
 void RTT_Param_Poll(void);
 
 /**
+ * @brief 扩展指令钩子 (v3): 内置指令 ($PING/$SET/$GET) 未匹配时先交给钩子处理,
+ *        钩子返回 true 表示已处理; 返回 false 则按未知指令应答。
+ *        rtt_capture 在 RTT_Capture_Init() 中自动注册 RTT_Capture_Command。只有一个钩子槽位。
+ */
+typedef bool (*RTT_CmdHook_t)(char *cmd_line);
+void RTT_Param_SetCommandHook(RTT_CmdHook_t hook);
+
+/**
  * @brief 手动发送单片机 ACK 应答或日志
  */
 void RTT_Send_Ack(const char *param_name, const char *value_str, bool success, const char *msg);

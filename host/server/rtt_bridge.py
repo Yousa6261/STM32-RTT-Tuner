@@ -38,6 +38,10 @@ BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR.parent / "web"
 CHIPS_FILE = WEB_DIR / "chips.json"   # 芯片配置单一数据源 (网页预设与网关共用, v3 P0)
 
+sys.path.insert(0, str(BASE_DIR))
+from capture_proto import CaptureDecoder  # noqa: E402  (v3 P2: RTT Ch2 触发采集)
+from mock_capture import MockCapture      # noqa: E402
+
 # 连接参数校验 (v3 P0 安全修复): openocd_target / openocd_ram 会被拼进 OpenOCD 的 Tcl 命令 (-c "..."),
 # 未校验时可注入任意 Tcl 语句。只接受下列格式。
 RE_OCD_TARGET = re.compile(r"^[a-z0-9_]{2,32}$")
@@ -445,20 +449,100 @@ class RTTManager:
         # 2026-10-23: Ch1 (JustFloat) 波形接收任务 -> 网页波形; VOFA+ 直接连 OpenOCD 19022,
         # OpenOCD RTT 服务端口不限连接数且每个连接都收到完整数据 (src/server/rtt_server.c), 两者互不抢占
         self.ch1_task: Optional[asyncio.Task] = None
+        # v3 P2: Ch2 触发采集接收任务 (OpenOCD 19023 / telnet 端口+2 / 仿真)
+        self.ch2_task: Optional[asyncio.Task] = None
+        self.mock_capture = MockCapture(lambda k: self.mock_engine.params[k]["val"])
+        self.cap_stats = {"captures": 0, "errors": 0, "crc_errors": 0}
 
     # 单条 wave 消息最多携带的帧数; 超出则等间隔抽取 (网页仅供观察, 全速细节请用 VOFA+)
     MAX_WAVE_FRAMES_PER_MSG = 250
     WAVE_FLUSH_INTERVAL = 0.025
+    CAP_PROGRESS_INTERVAL = 0.25
 
     def _start_ch1(self):
-        """连接成功后启动 Ch1 波形接收。telnet 模式按约定使用 端口+1, OpenOCD 模式固定 19022。"""
+        """连接成功后启动 Ch1 波形接收与 Ch2 采集接收。
+        telnet 模式按约定使用 端口+1 / 端口+2, OpenOCD 模式固定 19022 / 19023。"""
         if self.ch1_task:
             self.ch1_task.cancel()
+        if self.ch2_task:
+            self.ch2_task.cancel()
         if self.mode == "telnet":
             host, port = self.host, self.port + 1
         else:
             host, port = "127.0.0.1", 19022
         self.ch1_task = asyncio.create_task(self._ch1_rx_loop(host, port))
+        self.ch2_task = asyncio.create_task(self._ch2_rx_loop(host, port + 1))
+
+    async def _handle_cap_events(self, events: list, dec: CaptureDecoder, last_progress: list):
+        for ev in events:
+            kind = ev["event"]
+            if kind == "capture":
+                self.cap_stats["captures"] += 1
+                msg = {k: v for k, v in ev.items() if k != "event"}
+                # JSON 不允许 NaN/Infinity (浏览器 JSON.parse 会整条报错), 非有限值替换为 null
+                msg["channels"] = [[v if math.isfinite(v) else None for v in col] for col in ev["channels"]]
+                msg["type"] = "capture"
+                msg["crc_errors"] = dec.crc_errors
+                await self.broadcast(msg)
+            elif kind == "header":
+                await self.broadcast({"type": "capture_status", "stage": "receiving", "cap_id": ev["cap_id"],
+                                      "received": 0, "total": ev["total"]})
+            elif kind == "progress":
+                now = time.monotonic()
+                if now - last_progress[0] >= self.CAP_PROGRESS_INTERVAL or ev["received"] == ev["total"]:
+                    last_progress[0] = now
+                    await self.broadcast({"type": "capture_status", "stage": "receiving", "cap_id": ev["cap_id"],
+                                          "received": ev["received"], "total": ev["total"]})
+            elif kind == "error":
+                self.cap_stats["errors"] += 1
+                await self.broadcast({"type": "capture_status", "stage": "error", "message": ev["message"],
+                                      "crc_errors": dec.crc_errors})
+
+    async def _ch2_rx_loop(self, host: str, port: int):
+        """Ch2 (触发采集) 接收: 端口不存在 (固件未启用采集 / OpenOCD 未开 19023) 时只提示一次, 之后静默重试"""
+        announced = None
+        while self.connected:
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 3.0)
+            except Exception:
+                if announced is not False:
+                    await self.broadcast({"type": "capture_status", "stage": "offline",
+                                          "message": f"Ch2 采集端口 {host}:{port} 未就绪 (需 OpenOCD 'rtt server start {port} 2')"})
+                    announced = False
+                await asyncio.sleep(3.0)
+                continue
+            if announced is not True:
+                await self.broadcast({"type": "capture_status", "stage": "online", "message": f"已连接 Ch2 采集端口 {host}:{port}"})
+                announced = True
+            dec = CaptureDecoder()
+            last_progress = [0.0]
+            try:
+                while self.connected:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        break
+                    await self._handle_cap_events(dec.feed(chunk), dec, last_progress)
+            except Exception as e:
+                await self.broadcast({"type": "capture_status", "stage": "error", "message": f"Ch2 接收异常: {e}"})
+            finally:
+                self.cap_stats["crc_errors"] += dec.crc_errors
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+            if self.connected:
+                announced = None
+                await asyncio.sleep(1.0)
+
+    async def _mock_capture_loop(self):
+        dec = CaptureDecoder()
+        last_progress = [0.0]
+        await self.broadcast({"type": "capture_status", "stage": "online", "message": "仿真 Ch2 触发采集已就绪"})
+        while self.connected:
+            await asyncio.sleep(0.05)
+            data = self.mock_capture.tick(time.monotonic())
+            if data:
+                await self._handle_cap_events(dec.feed(data), dec, last_progress)
 
     def _forward_frames(self, frames: list):
         """全部帧 (不抽取) 交给 VOFA+ 1347 转发; 回调异常不得影响网页波形"""
@@ -641,6 +725,7 @@ class RTTManager:
             self.connected = True
             self.telemetry_task = asyncio.create_task(self._mock_telemetry_loop())
             self.ch1_task = asyncio.create_task(self._mock_wave_loop())
+            self.ch2_task = asyncio.create_task(self._mock_capture_loop())
             return True, "已连接到内置虚拟 STM32 仿真器 (Mock Mode)"
 
         elif mode == "telnet":
@@ -720,8 +805,10 @@ class RTTManager:
                 # 修复(B2b): RTT 扫描范围按芯片系列自适应, 防止越过 SRAM 边界触发 Bus Fault
                 "-c", f"rtt setup {self.openocd_ram} {self._rtt_scan_size()} {{SEGGER RTT}}",
                 "-c", "rtt start",
+                "-c", "rtt polling_interval 20",
                 "-c", "rtt server start 19021 0",
-                "-c", "rtt server start 19022 1"
+                "-c", "rtt server start 19022 1",
+                "-c", "rtt server start 19023 2"
             ])
             try:
                 startupinfo = None
@@ -791,6 +878,9 @@ class RTTManager:
         if self.ch1_task:
             self.ch1_task.cancel()
             self.ch1_task = None
+        if self.ch2_task:
+            self.ch2_task.cancel()
+            self.ch2_task = None
 
         if self.socket:
             try:
@@ -843,7 +933,9 @@ class RTTManager:
         if self.mode == "mock":
             # 仿真模式增加微小延迟 (10~30ms)，逼近真实通信
             await asyncio.sleep(0.015)
-            replies = self.mock_engine.process_command(line)
+            replies = self.mock_capture.process(line.strip())
+            if replies is None:
+                replies = self.mock_engine.process_command(line)
             for rep in replies:
                 await self._handle_received_line(rep)
             return True
@@ -934,6 +1026,12 @@ class RTTManager:
             "data": line_clean,
             "timestamp": t_now
         })
+
+        # v3 P2: 触发采集应答单独转发给网页采集面板
+        if line_clean.startswith("$ACK:CAP:") or line_clean.startswith("$ACK:ERR:CAP:"):
+            await self.broadcast({"type": "cap_ack", "data": line_clean,
+                                  "ok": line_clean.startswith("$ACK:CAP:"), "timestamp": t_now})
+            return
 
         # 解析 ACK / 响应
         if line_clean.startswith("$ACK:SET:"):

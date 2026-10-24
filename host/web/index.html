@@ -342,6 +342,8 @@
               <option value="10">10 s</option>
             </select>
             <button id="btn-wave-pause" class="btn btn-xs btn-secondary" title="冻结画面 (后台继续接收)">暂停</button>
+            <button id="btn-wave-analyze" class="btn btn-xs btn-secondary" title="将当前 Ch1 缓存送入下方阶跃/FFT/STFT分析面板">送入分析</button>
+            <button id="btn-wave-csv" class="btn btn-xs btn-secondary" title="将当前 Ch1 缓存波形导出为 CSV">导出 CSV</button>
           </div>
         </div>
         <div id="wave-legend" class="wave-legend">
@@ -387,8 +389,88 @@
 
     </section>
 
+    <!-- v3: 触发采集 (RTT Ch2) + 分析 (阶跃响应 / FFT / STFT), 横跨两列 -->
+    <section class="card capture-card" id="capture-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="card-icon">🎯</span>
+          <h3>触发采集与分析 (Ch2，片上全速缓存)</h3>
+        </div>
+        <div class="wave-toolbar">
+          <span class="tele-rate-badge" id="cap-status" title="采集状态">Ch2 未连接</span>
+          <progress id="cap-progress" max="1" value="0" title="传输进度"></progress>
+        </div>
+      </div>
+      <div class="cap-controls">
+        <label>触发通道 <select id="cap-ch" class="custom-select wave-select"><option value="0">CH0</option></select></label>
+        <label>边沿 <select id="cap-edge" class="custom-select wave-select">
+          <option value="rise" selected>上升</option><option value="fall">下降</option><option value="both">双沿</option></select></label>
+        <label>电平 <input id="cap-level" class="custom-input cap-num" type="number" step="any" value="0.5"></label>
+        <label>预触发 % <input id="cap-pre" class="custom-input cap-num" type="number" min="0" max="99" value="20"></label>
+        <label>分频 <input id="cap-div" class="custom-input cap-num" type="number" min="1" value="1"></label>
+        <label>模式 <select id="cap-run" class="custom-select wave-select">
+          <option value="single" selected>单次</option><option value="normal">常规 (触发后自动重新布防)</option><option value="auto">自动 (超时强制触发)</option></select></label>
+        <label>超时 ms <input id="cap-auto" class="custom-input cap-num" type="number" min="1" value="200"></label>
+        <button id="btn-cap-arm" class="btn btn-xs btn-highlight" title="下发配置并布防">布防</button>
+        <button id="btn-cap-force" class="btn btn-xs btn-secondary" title="立即触发">强制</button>
+        <button id="btn-cap-stop" class="btn btn-xs btn-secondary">停止</button>
+        <button id="btn-cap-read" class="btn btn-xs btn-secondary" title="单次模式下重传上一次采集 (传输出错时使用)">重传</button>
+        <button id="btn-cap-info" class="btn btn-xs btn-secondary" title="查询固件采集能力与中断耗时">信息</button>
+        <span class="cap-sep"></span>
+        <select id="cap-history" class="custom-select wave-select" title="最近 10 次采集"><option value="">(无采集)</option></select>
+        <button id="btn-cap-csv" class="btn btn-xs btn-secondary">导出 CSV</button>
+        <button id="btn-cap-json" class="btn btn-xs btn-secondary">导出 JSON</button>
+        <label class="btn btn-xs btn-secondary cap-import">导入 JSON<input id="cap-import" type="file" accept=".json,application/json" hidden></label>
+      </div>
+      <div id="cap-legend" class="wave-legend"><span class="wave-empty-hint">尚无采集。固件需集成 rtt_capture 并在中断中调用 RTT_Capture_SampleF()；仿真模式可直接体验。</span></div>
+      <div class="chart-container">
+        <canvas id="capCanvas" width="1000" height="260"></canvas>
+      </div>
+      <div id="cap-cursor" class="cap-cursor">左键单击放置光标 A，右键（或 Shift+左键）放置光标 B；滚轮缩放，拖动平移，双击复位。</div>
+      <div class="cap-tabs">
+        <button class="cap-tab active" data-tab="step">阶跃响应</button>
+        <button class="cap-tab" data-tab="fft">频谱 FFT</button>
+        <button class="cap-tab" data-tab="stft">时频 STFT</button>
+      </div>
+      <div class="cap-pane" id="cap-pane-step">
+        <div class="cap-controls">
+          <label>参考通道 <select id="step-ref" class="custom-select wave-select"></select></label>
+          <label>响应通道 <select id="step-y" class="custom-select wave-select"></select></label>
+          <label>上升区间 <select id="step-rise" class="custom-select wave-select"><option value="0.1,0.9" selected>10%–90%</option><option value="0.05,0.95">5%–95%</option><option value="0,1">0%–100%</option></select></label>
+          <label>调节带 <select id="step-band" class="custom-select wave-select"><option value="0.02" selected>±2%</option><option value="0.05">±5%</option></select></label>
+          <label>平滑点数 <input id="step-smooth" class="custom-input cap-num" type="number" min="1" value="1"></label>
+          <button id="btn-step-run" class="btn btn-xs btn-highlight">分析</button>
+        </div>
+        <div id="step-result" class="cap-result">采集后自动分析（参考通道中需有一次阶跃）。</div>
+      </div>
+      <div class="cap-pane hidden" id="cap-pane-fft">
+        <div class="cap-controls">
+          <label>通道 <select id="fft-ch" class="custom-select wave-select"></select></label>
+          <label>窗函数 <select id="fft-win" class="custom-select wave-select"><option value="hann" selected>Hann</option><option value="hamming">Hamming</option><option value="blackmanharris">Blackman-Harris</option><option value="rect">矩形</option></select></label>
+          <label>纵轴 <select id="fft-scale" class="custom-select wave-select"><option value="db" selected>dB</option><option value="lin">线性</option></select></label>
+          <label>范围 <select id="fft-range" class="custom-select wave-select"><option value="all" selected>全部 (触发前后)</option><option value="post">仅触发后</option><option value="pre">仅触发前</option></select></label>
+          <label>最高频率 Hz <input id="fft-fmax" class="custom-input cap-num" type="number" min="0" value="0" title="0 = 奈奎斯特频率"></label>
+          <label>基波 Hz <input id="fft-f1" class="custom-input cap-num" type="number" min="0" value="0" title="填写后计算 THD; 0 = 取最大峰"></label>
+        </div>
+        <canvas id="fftCanvas" width="1000" height="220"></canvas>
+        <div id="fft-result" class="cap-result"></div>
+      </div>
+      <div class="cap-pane hidden" id="cap-pane-stft">
+        <div class="cap-controls">
+          <label>通道 <select id="stft-ch" class="custom-select wave-select"></select></label>
+          <label>窗长 <select id="stft-win" class="custom-select wave-select"><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option></select></label>
+          <label>重叠 <select id="stft-ovl" class="custom-select wave-select"><option value="0.5">50%</option><option value="0.75" selected>75%</option><option value="0.875">87.5%</option></select></label>
+          <label>动态范围 dB <input id="stft-range" class="custom-input cap-num" type="number" min="20" max="160" value="80"></label>
+        </div>
+        <canvas id="stftCanvas" width="1000" height="260"></canvas>
+        <div id="stft-result" class="cap-result"></div>
+      </div>
+    </section>
+
   </main>
 
+  <script src="analysis.js"></script>
   <script src="app.js"></script>
+  <script src="capture_panel.js"></script>
 </body>
 </html>

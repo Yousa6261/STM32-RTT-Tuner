@@ -1023,3 +1023,167 @@ body {
   color: var(--accent-green-bright);
   min-width: 70px;
 }
+
+/* ================= v3: Ch2 触发采集与时频分析面板 ================= */
+.capture-card {
+  grid-column: 1 / -1;
+  border-color: rgba(57, 197, 187, 0.28);
+}
+
+#cap-progress {
+  width: 110px;
+  height: 10px;
+  accent-color: var(--accent-cyan);
+}
+
+.cap-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 10px 14px;
+  background-color: rgba(22, 27, 34, 0.65);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.cap-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.cap-num {
+  width: 72px;
+  padding: 3px 6px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.cap-sep {
+  width: 1px;
+  height: 18px;
+  background-color: var(--border-color);
+  margin: 0 2px;
+}
+
+.cap-import {
+  cursor: pointer;
+}
+
+#capCanvas,
+#fftCanvas,
+#stftCanvas {
+  width: 100%;
+  display: block;
+  background-color: #0b0e14;
+  border-radius: var(--radius-sm);
+}
+
+#capCanvas {
+  height: 260px;
+  cursor: crosshair;
+}
+
+#fftCanvas {
+  height: 220px;
+}
+
+#stftCanvas {
+  height: 260px;
+}
+
+.cap-cursor {
+  padding: 6px 14px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--accent-cyan);
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.cap-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 14px 0;
+  background-color: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.cap-tab {
+  background-color: transparent;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  border-bottom: none;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.cap-tab:hover {
+  color: var(--text-main);
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+.cap-tab.active {
+  color: var(--accent-cyan);
+  background-color: var(--bg-card);
+  border-color: var(--border-color);
+}
+
+.cap-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.cap-result {
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-main);
+}
+
+.cap-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+.cap-metric-box {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cap-metric-box.highlight {
+  border-color: rgba(57, 197, 187, 0.45);
+  background: linear-gradient(145deg, rgba(22, 27, 34, 0.95), rgba(15, 32, 39, 0.45));
+}
+
+.cap-metric-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.cap-metric-value {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent-cyan);
+}
+
+.cap-metric-sub {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}

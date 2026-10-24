@@ -19,6 +19,13 @@ static size_t s_param_count = 0;
 static char s_rx_line_buf[RTT_RX_BUFFER_SIZE];
 static size_t s_rx_line_len = 0;
 
+/* 扩展指令钩子 (v3, 如 rtt_capture 的 $CAP:...) */
+static RTT_CmdHook_t s_cmd_hook = NULL;
+
+void RTT_Param_SetCommandHook(RTT_CmdHook_t hook) {
+    s_cmd_hook = hook;
+}
+
 /* 内部辅助函数 */
 static ParamEntry_t* find_param(const char *name);
 static void process_command(char *cmd_line);
@@ -189,6 +196,11 @@ static void process_command(char *cmd_line) {
         } else {
             SEGGER_RTT_printf(RTT_PARAM_CHANNEL, "$ACK:ERR:NOT_FOUND:%s\n", name);
         }
+        return;
+    }
+
+    /* 扩展指令 (钩子) */
+    if (s_cmd_hook != NULL && s_cmd_hook(cmd_line)) {
         return;
     }
 

@@ -583,6 +583,55 @@ except (OSError, ValueError):
 
 ---
 
+## 2026-10-24 · 第 14 批（v3 P2/P3/P4）：片上触发采集 (`rtt_capture`) + 时频分析面板 + 多芯片适配与真机验证
+
+### FIX-031 ✅ 🟡 [v3 P2] 片上触发采集模块 `rtt_capture` 与 Ch2 协议栈
+
+- **设计目标**：兼顾 **(a) 高频控制环绝对实时性**（10~100 kHz 中断内零锁、零 RTT 调用，耗时 < 1 μs）与 **(b) 准实时连续触发观察**（单次/常规/自动重布防 + Ch1 连续流并行）。
+- **新增/修改文件**：
+  - `firmware/rtt_core/rtt_capture.h`、`firmware/rtt_core/rtt_capture.c`：片上环形缓冲区（默认 64 KB = 4096 点 × 4 通道 `float32`，可通过 `RTT_CAP_BUF_BYTES` 裁剪为 4 KB 适配 F103C8/G0）、支持 `RTT_CAP_F32` 与 `RTT_CAP_I16` 两种样本格式、支持上升/下降/双沿触发、预触发比例 `0~99%`、整数分频 `div`、单次 (`single`)/常规 (`normal`)/自动超时触发 (`auto`) 模式，以及 DWT 周期计数剖析 (`RTT_CAP_PROFILE=1`)。
+  - `firmware/rtt_core/rtt_param_parser.h/.c`：新增 `RTT_Param_SetCommandHook`，将 `$CAP:INFO / STAT / CFG / ARM / FORCE / STOP / READ` 指令无缝桥接至 `RTT_Capture_Command`。
+  - `host/server/capture_proto.py`、`host/server/mock_capture.py`、`host/server/rtt_bridge.py`：实现 Ch2 二进制帧（`A5 5A | type | len | payload | crc16_ccitt`）流式状态机解码、整包二级 CRC16 校验、残包/坏头告警 (`_loss_reported`)、传输进度节流广播 (`capture_status`) 以及仿真模式下的二阶欠阻尼阶跃 + 多频正弦触发采集生成。
+  - `docs/CAPTURE_PROTOCOL.md`：完整记录 Ch2 帧格式与 `$CAP:...` 命令集规范。
+- **验证**：
+  - 主机 C 单元测试 `TESTs/test_capture_host.py`：**37/37 通过**（含环形回绕、上升/下降/双沿、int16 缩放、预触发未满不误触发、自动超时触发、RTT 满缓冲零丢点重试、CRC 破坏检测、`$CAP:READ` 重传）；
+  - 跨架构交叉编译 `TESTs/test_firmware_crossbuild.py`（`arm-none-eabi-gcc -Wall -Wextra -Werror -Wcast-align`）：覆盖 **Cortex-M0+ (G0)、Cortex-M3 (F103)、Cortex-M4F (F4/G4/F3)、Cortex-M7 (H7)** 标准配置与小 RAM 配置（4 KB 缓冲下 `.bss = 5878 B`），**11/11 全部通过**；
+  - 网关协议与生命周期测试 `TESTs/test_capture_gateway.py`：**16/16 通过**；
+  - **STM32H723 + Horco 无线 DAPLink 真机实测 (`TESTs/hw/capture_hw_test.py`)**：
+    - 烧录前完整备份原片 1 MB Flash 至 `F:\qwe\NEW_Project\DM_H7\_backup_2026-10-24_175623_rtt_core_sync\flash_dump_before_capdemo_0x08000000_1MB.bin`；
+    - 在 TIM7 20 kHz 中断内执行 4 通道触发采集（`ref` 10 Hz 方波、`plant` 二阶欠阻尼阶跃响应 $\zeta=0.3, f_n=100\text{ Hz}$、`sine` $1\text{ kHz}+0.3\times 3\text{ kHz}$、`count` 递增序号）：
+      - **ISR DWT 耗时 (`$CAP:STAT`)**：平均 **231~244 cycles (0.48 μs @ 480 MHz)**，最大 **396~398 cycles (0.83 μs)**，仅占 20 kHz 中断周期的 **1.65%**；
+      - **传输速率**：在 `rtt polling_interval 10` 下，64 KB (4096 点 × 4 通道) 仅耗时 **0.91~0.94 s (68.1~70.4 KiB/s)**，自动模式 20 s 连续完成 **16 次完整采集 (0.80 次/s)**，**0 CRC 错误、0 样本序号跳变**，并发 Ch0 PING 平均 **27.4 ms**。
+
+### FIX-032 ✅ 🟡 [v3 P3] 前端时频域分析引擎 (`analysis.js`) 与触发采集面板 (`capture_panel.js`)
+
+- **新增/修改文件**：
+  - `host/web/analysis.js`：纯函数信号处理与控制指标计算库（无 DOM 依赖，支持浏览器与 Node 双端运行）：
+    - **FFT 频谱与 THD**：基 2 FFT、4 种窗函数（Hann / Hamming / Blackman-Harris / 矩形）、**加窗加权均值去直流**、**主瓣能量法 (`toneAmplitude`) 幅值估计**（解决非整周期栅栏效应与补零后的单 bin 幅值偏差，任意偏频正弦幅值误差 < 0.5%）、对数抛物线频率插值、总谐波失真 `thd()`；
+    - **STFT 短时傅里叶时频分析 (`stft`)**：输出二维时频功率谱矩阵 (dB)；
+    - **阶跃响应自动分析 (`stepResponse`)**：自动检测参考通道跳变沿，计算 $t_d, t_r, t_p, \sigma\%, t_s, e_{ss}$ 并反推等效二阶阻尼比 $\zeta$ 与自然频率 $\omega_n$；
+    - **CSV 导出 (`captureToCsv` / `toCSV`)**。
+  - `host/web/capture_panel.js`、`host/web/index.html`、`host/web/app.js`、`host/web/style.css`：
+    - 新增跨两列的 `#capture-card` 触发采集与分析面板，支持布防/强制/停止/重传/信息查询、最近 10 次采集历史切换、滚轮缩放、拖拽平移、A/B 双光标 ($\Delta t, 1/|\Delta t|, \Delta y$)、阶跃特征点叠加、CSV/JSON 导出与 JSON 导入；
+    - 在 Ch1 波形卡片新增 `送入分析` 与 `导出 CSV` 按钮，支持将 Ch1 连续波形缓存一键导入下方分析面板进行阶跃/FFT/STFT 分析。
+- **验证**：
+  - 算法单元测试 `TESTs/test_analysis.js`：**51/51 通过**；
+  - 面板联动单元测试 `TESTs/test_capture_panel.js`：**24/24 通过**；
+  - **真机端到端全链路测试 (`TESTs/hw/e2e_web_capture_hw_test.py`)**：
+    - `STM32H723 (无线 DAPLink)` → `OpenOCD (19021/19022/19023)` → `rtt_bridge.py (WebSocket)` → `capture_panel.js + analysis.js`；
+    - 实测捕获 4096 点 × 4 通道 @ 20 kHz：前端自动算出超调量 **37.14%**（理论值 37.23%）、阻尼比 $\zeta = \mathbf{0.3007}$（理论值 0.3000）、上升时间 **4.20 ms**、调节时间 **35.6 ms**、FFT 主峰 **999.93 Hz (幅值 1.0000)**、THD **30.00%**（理论值 30.00%）、STFT **61 帧 × 129 频点**。
+
+### FIX-033 ✅ 🟢 [v3 P1/P4] 多芯片示例 (`F4+FreeRTOS` / `F103C8` / `G474 100kHz`) 与启动链路优化
+
+- **新增/修改文件**：
+  - `firmware/examples/example_f4_freertos.c`：STM32F407 / F427 + FreeRTOS 1 kHz 控制任务 + 低优先级 RTT 服务任务集成范例；
+  - `firmware/examples/example_f103c8_minimal.c`：STM32F103C8T6 (20 KB SRAM) / STM32G0 小内存 `int16_t` 采集范例；
+  - `firmware/examples/example_g474_foc_100khz.c`：STM32G474 / STM32H723 10~100 kHz 电流环 ISR 零阻塞采样范例；
+  - `host/server/rtt_bridge.py`、`scripts/openocd_rtt.py`、`start_all.bat`、`F:\qwe\NEW_Project\DM_H7\run_openocd.bat`、`一键启动全套.bat`：默认开启 `19021/19022/19023` 三端口并设置 `rtt polling_interval 20`（20 ms 轮询），`DM_H7` 下启动脚本统一指向 `F:\.gemini\RTTproject`。
+- **验证**：`python TESTs/run_all.py` **14/14 测试套件全部通过**。
+
+---
+
 ## 待办清单 (源自 2026-09-12 深度审查，按优先级排序)
 
 ### 🔴 接入电机控制前必修
@@ -593,22 +642,22 @@ except (OSError, ValueError):
 
 ### 🟡 计划修复
 
-- [ ] **F3** TIM7 2kHz 空中断（抢占优先级 0 却无 `HAL_TIM_PeriodElapsedCallback` 实现）：删除或实现回调。
-- [x] **F4** (FIX-023 已修复) `sins` 参数注册范围 0.0~6.28 与实际值域 -1..1 不符，网页滑条显示错乱。
+- [x] **F3** (FIX-031 已实现) TIM7 2kHz 空中断（抢占优先级 0 却无 `HAL_TIM_PeriodElapsedCallback` 实现）：在 `CAP_DEMO` 下已实现 `HAL_TIM_PeriodElapsedCallback`（20 kHz 触发采集信号源与 `RTT_Capture_SampleF` 调用）。
+- [x] **F4** (FIX-023/FIX-025 已修复) `sins` 参数已取消注册并替换为可调幅值 `wave_amp` (0~2000)。
 - [x] **F5** (FIX-018：ConfigUpBuffer 已修复；Init 为静态初始化后的空操作，无害，保留) `SEGGER_RTT_Init` 因 `acID[0]=='S'` 检查成为永久空操作；`ConfigUpBuffer(0,...)` 静默无效却返回 0。
 - [x] **F6** (FIX-018 已补齐实现) `SEGGER_RTT.h` 声明了 4 个不存在的函数 (`GetKey/WaitKey/HasKey/ConfigDownBuffer`)，一调用即链接失败。
 - [ ] **F7** JustFloat 尾帧注释错误：`00 00 80 7F` 小端 = 0x7F800000 是 +Infinity 非 NaN（字节符合 VOFA+ 规范，仅注释误导）。
 - [ ] **F8** FDCAN 引脚 GPIO_SPEED 配 LOW，1Mbps 边沿 slew 不足风险。
 - [ ] **F9** 遗留 FireWater API 仍向 Ch0 打文本波形，与"Ch0 纯信令"架构矛盾。
-- [x] **P1** (FIX-020 已处理：移除 1347 的 JustFloat 中继，VOFA+ 直连 19022；原文“OpenOCD rtt server 仅支持单客户端”经源码与实测确认**错误**，实际支持多客户端) rtt_bridge 的 1347 中继仅在自启 OpenOCD 模式下转发 19022；主推流程（外部 OpenOCD + telnet 模式）下 VOFA+ 连 1347 无波形。
+- [x] **P1** (FIX-020/021 已处理：1347 转发对齐的 JustFloat 帧，所有连接模式可用；VOFA+ 也可直连 19022)
 - [ ] **P2** telnet 断线无自动重连（维度四规划内）；rtt_vofa_bridge 重连时旧 socket 未 close 存在 fd 泄漏。
 - [ ] **P3** mock + `--protocol justfloat` 组合输出为零（Mock 生成冒号格式，解析器只认等号/裸数字）。
 - [ ] **P4** `rtt_vofa_bridge --mode jlink` 为无效选项（choices 含 jlink 但无处理分支，恒失败）；与 rtt_bridge 同跑时默认同抢 1347 端口。
 
 ### 🟢 工程化建议
 
-- [ ] 工具链迁出 `C:\Users\12165\.gemini\antigravity\scratch`（AI IDE 草稿目录，易被清理且路径被 .bat 硬编码不可移植）。
-- [ ] `一键启动全套.bat` 拉起外部 OpenOCD 后，网页默认连接模式应为 telnet 而非 daplink（当前会二次拉起 OpenOCD 抢占调试器必然失败）。
+- [x] (FIX-027 已完成) 工具链已迁出 `C:\Users\12165\.gemini\antigravity\scratch`，独立建库于 `F:\.gemini\RTTproject` 并纳入 Git 版本控制。
+- [x] (FIX-018 C1 已完成) `daplink`/`stlink` 模式启动前自动探测 19021 端口，若外部 OpenOCD 已运行则直接复用连接，不会二次拉起 OpenOCD 抢占调试器。
 - [ ] 清理 EIDE 陈旧构建产物（`MDK-ARM\build\`，9/9 无 rtt_waveform）避免与 Keil 真实输出（`MDK-ARM\DM_H7\`）混淆。
 - [ ] 关键符号（如 `DM8009_Task`）做构建后存在性校验，防止"0 警告 0 错误"掩盖死代码移除。
 

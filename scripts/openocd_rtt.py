@@ -76,7 +76,7 @@ def main(argv=None) -> int:
     ap.add_argument("--chip", default="h723")
     ap.add_argument("--probe", default="auto", choices=["auto", "stlink", "cmsis-dap", "wch-dap"])
     ap.add_argument("--khz", type=int, default=None)
-    ap.add_argument("--poll", type=int, default=None, help="RTT polling interval ms (OpenOCD default 100)")
+    ap.add_argument("--poll", type=int, default=20, help="RTT polling interval ms (default 20; OpenOCD built-in default is 100)")
     ap.add_argument("--no-ch2", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", action="store_true")

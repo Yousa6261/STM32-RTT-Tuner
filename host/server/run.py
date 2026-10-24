@@ -9,7 +9,9 @@
 """
 import argparse
 import asyncio
+import ctypes
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -18,10 +20,10 @@ import webbrowser
 from pathlib import Path
 
 if sys.platform == 'win32':
-    os.system('chcp 65001 >nul')
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
-        sys.stderr.reconfigure(encoding='utf-8')
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
 
@@ -31,20 +33,28 @@ sys.path.insert(0, str(SERVER_DIR))
 from rtt_bridge import main as bridge_main  # noqa: E402
 
 
+def _is_port_open(host: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def start_openocd_window(chip: str, poll_ms: int):
+    if _is_port_open("127.0.0.1", 19021):
+        print("[1/2] 检测到 127.0.0.1:19021 已有 OpenOCD RTT 服务运行中，直接复用现有服务。")
+        return
     ocd_script = ROOT_DIR / "scripts" / "openocd_rtt.py"
     if not ocd_script.exists():
         print(f"[WARN] 未找到 {ocd_script}，请直接在网页中选择 DAP-Link / ST-Link 模式连接。")
         return
     print(f"[1/2] 正在独立窗口启动 OpenOCD 三通道 RTT 服务 (chip={chip}, poll={poll_ms}ms)...")
-    if sys.platform == "win32":
-        # 在独立控制台窗口启动 OpenOCD，即使失败也保留窗口供查看原因，且不阻塞网页启动
-        cmd = f'title OpenOCD RTT Server ({chip}) & "{sys.executable}" "{ocd_script}" --chip {chip} --poll {poll_ms} & pause'
-        subprocess.Popen(["cmd", "/c", cmd], cwd=str(ROOT_DIR),
-                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-    else:
-        subprocess.Popen([sys.executable, str(ocd_script), "--chip", chip, "--poll", str(poll_ms)],
-                         cwd=str(ROOT_DIR))
+    # 直接通过 CreateProcess 启动 Python 子进程 + CREATE_NEW_CONSOLE，
+    # 严禁通过 cmd.exe /c 中转 (Python list2cmdline 会将内部双引号转义为 \"，导致 Windows cmd.exe 报错闪退)。
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if sys.platform == "win32" else 0
+    cmd = [sys.executable, str(ocd_script), "--chip", str(chip), "--poll", str(poll_ms), "--pause-on-error"]
+    subprocess.Popen(cmd, cwd=str(ROOT_DIR), creationflags=creationflags)
 
 
 def open_browser(url: str):
@@ -65,11 +75,18 @@ if __name__ == "__main__":
     if args.openocd:
         start_openocd_window(args.chip, args.poll)
 
+    url = "http://127.0.0.1:8765"
+    if _is_port_open("127.0.0.1", 8765):
+        print(f"[OK] 检测到 Web 调参台服务 ({url}) 已在运行中，无需重复启动。")
+        if not args.no_browser:
+            print(f"正在直接打开浏览器: {url}")
+            webbrowser.open(url)
+        sys.exit(0)
+
     if not args.no_browser:
-        url = "http://127.0.0.1:8765"
         threading.Thread(target=open_browser, args=(url,), daemon=True).start()
 
     try:
-        asyncio.run(bridge_main(allow_lan=args.lan))
+        asyncio.run(bridge_main(allow_lan=args.lan, auto_openocd_chip=args.chip if args.openocd else None))
     except KeyboardInterrupt:
         print("\n已退出服务。")

@@ -1,72 +1,88 @@
 /**
  * @file    launcher_stub.c
- * @brief   Lightweight native Windows launcher for RTTproject Portable Release.
+ * @brief   Native Windows Unicode (Wide-Char) launcher for RTTproject Portable Release.
+ *          Immune to Chinese/Unicode paths, spaces, and parentheses.
  *          Resolves bundled runtime\python\python.exe and runtime\openocd\bin,
- *          sets UTF-8 console & PATH, and runs host\server\run.py.
+ *          sets UTF-8 console & environment variables, and runs host\server\run.py.
  */
+#define UNICODE
+#define _UNICODE
 #include <windows.h>
+#include <shellapi.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
+#include <wchar.h>
 
-#ifndef EXTRA_ARGS
-#define EXTRA_ARGS ""
+#ifndef EXTRA_ARGS_W
+#define EXTRA_ARGS_W L""
 #endif
 
-int main(int argc, char **argv) {
-    char exe_path[MAX_PATH];
-    char root_dir[MAX_PATH];
-    char py_exe[MAX_PATH];
-    char ocd_bin[MAX_PATH];
-    char run_py[MAX_PATH];
-    char new_path[32768];
-    char cmd_line[4096];
+int main(void) {
+    wchar_t exe_path[4096];
+    wchar_t root_dir[4096];
+    wchar_t py_exe[4096];
+    wchar_t ocd_bin[4096];
+    wchar_t run_py[4096];
+    wchar_t new_path[32768];
+    wchar_t cmd_line[8192];
 
     SetConsoleOutputCP(65001);
-    SetConsoleTitleA("STM32 SEGGER RTT v3.0 - Real-Time Tuner & Analyzer");
+    SetConsoleTitleW(L"STM32 SEGGER RTT v3.0 - Real-Time Tuner & Analyzer");
 
-    DWORD len = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
-        fprintf(stderr, "[ERROR] Failed to resolve executable path.\n");
+    DWORD len = GetModuleFileNameW(NULL, exe_path, 4096);
+    if (len == 0 || len >= 4096) {
+        fwprintf(stderr, L"[ERROR] Failed to resolve executable path.\n");
         return 1;
     }
-    strcpy(root_dir, exe_path);
-    char *last_slash = strrchr(root_dir, '\\');
-    if (last_slash) *last_slash = '\0';
+    wcscpy(root_dir, exe_path);
+    wchar_t *last_slash = wcsrchr(root_dir, L'\\');
+    if (last_slash) *last_slash = L'\0';
 
-    SetCurrentDirectoryA(root_dir);
+    SetCurrentDirectoryW(root_dir);
+    _wputenv(L"PYTHONUTF8=1");
+    _wputenv(L"PYTHONIOENCODING=utf-8");
 
     /* Prepend runtime\openocd\bin to PATH if present */
-    snprintf(ocd_bin, sizeof(ocd_bin), "%s\\runtime\\openocd\\bin", root_dir);
-    DWORD attr = GetFileAttributesA(ocd_bin);
+    _snwprintf(ocd_bin, 4096, L"%ls\\runtime\\openocd\\bin", root_dir);
+    DWORD attr = GetFileAttributesW(ocd_bin);
     if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        char *old_path = getenv("PATH");
-        snprintf(new_path, sizeof(new_path), "PATH=%s;%s", ocd_bin, old_path ? old_path : "");
-        _putenv(new_path);
+        const wchar_t *old_path = _wgetenv(L"PATH");
+        _snwprintf(new_path, 32768, L"PATH=%ls;%ls", ocd_bin, old_path ? old_path : L"");
+        _wputenv(new_path);
     }
 
     /* Prefer bundled runtime\python\python.exe, fallback to system python */
-    snprintf(py_exe, sizeof(py_exe), "%s\\runtime\\python\\python.exe", root_dir);
-    if (GetFileAttributesA(py_exe) == INVALID_FILE_ATTRIBUTES) {
-        strcpy(py_exe, "python");
+    _snwprintf(py_exe, 4096, L"%ls\\runtime\\python\\python.exe", root_dir);
+    if (GetFileAttributesW(py_exe) == INVALID_FILE_ATTRIBUTES) {
+        wcscpy(py_exe, L"python");
     }
 
-    snprintf(run_py, sizeof(run_py), "%s\\host\\server\\run.py", root_dir);
-    snprintf(cmd_line, sizeof(cmd_line), "\"%s\" \"%s\" %s", py_exe, run_py, EXTRA_ARGS);
-    for (int i = 1; i < argc; i++) {
-        strncat(cmd_line, " \"", sizeof(cmd_line) - strlen(cmd_line) - 1);
-        strncat(cmd_line, argv[i], sizeof(cmd_line) - strlen(cmd_line) - 1);
-        strncat(cmd_line, "\"", sizeof(cmd_line) - strlen(cmd_line) - 1);
+    _snwprintf(run_py, 4096, L"%ls\\host\\server\\run.py", root_dir);
+    _snwprintf(cmd_line, 8192, L"\"%ls\" \"%ls\" %ls", py_exe, run_py, EXTRA_ARGS_W);
+
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv) {
+        for (int i = 1; i < wargc; i++) {
+            size_t cur = wcslen(cmd_line);
+            if (cur + wcslen(wargv[i]) + 6 < 8192) {
+                wcscat(cmd_line, L" \"");
+                wcscat(cmd_line, wargv[i]);
+                wcscat(cmd_line, L"\"");
+            }
+        }
+        LocalFree(wargv);
     }
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    if (!CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE, 0, NULL, root_dir, &si, &pi)) {
-        fprintf(stderr, "[ERROR] Failed to launch Python runtime: %s (err=%lu)\n", cmd_line, GetLastError());
-        system("pause");
+    if (!CreateProcessW(NULL, cmd_line, NULL, NULL, TRUE, 0, NULL, root_dir, &si, &pi)) {
+        fwprintf(stderr, L"[ERROR] Failed to launch Python runtime (err=%lu)\n", GetLastError());
+        _wsystem(L"pause");
         return 1;
     }
 
@@ -76,7 +92,7 @@ int main(int argc, char **argv) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (exit_code != 0) {
-        system("pause");
+        _wsystem(L"pause");
     }
     return (int)exit_code;
 }

@@ -88,11 +88,11 @@ def compile_launchers(pkg_dir: Path):
     if not gcc or not stub.exists():
         step("WARNING: gcc not found; skipping .exe launcher compilation (.bat files still created).")
         return
-    step("Compiling native Windows launchers (RTT_Tuner.exe, RTT_All_In_One.exe, RTT_Tuner_LAN_Share.exe) ...")
+    step("Compiling native Windows Unicode launchers (RTT_Tuner.exe, RTT_All_In_One.exe, RTT_Tuner_LAN_Share.exe) ...")
     subprocess.run([gcc, "-O2", "-s", str(stub), "-o", str(pkg_dir / "RTT_Tuner.exe")], check=True)
-    subprocess.run([gcc, "-O2", "-s", '-DEXTRA_ARGS="--openocd"', str(stub),
+    subprocess.run([gcc, "-O2", "-s", '-DEXTRA_ARGS_W=L"--openocd"', str(stub),
                     "-o", str(pkg_dir / "RTT_All_In_One.exe")], check=True)
-    subprocess.run([gcc, "-O2", "-s", '-DEXTRA_ARGS="--lan"', str(stub),
+    subprocess.run([gcc, "-O2", "-s", '-DEXTRA_ARGS_W=L"--lan"', str(stub),
                     "-o", str(pkg_dir / "RTT_Tuner_LAN_Share.exe")], check=True)
 
 
@@ -104,6 +104,8 @@ def write_batch_and_readme(pkg_dir: Path):
         "@echo off\r\n"
         "title STM32 RTT v3.0 Web Param Tuner and Analyzer\r\n"
         "cd /d \"%~dp0\"\r\n"
+        "set PYTHONUTF8=1\r\n"
+        "set PYTHONIOENCODING=utf-8\r\n"
         "set \"PATH=%~dp0runtime\\openocd\\bin;%PATH%\"\r\n"
         "if exist \"%~dp0runtime\\python\\python.exe\" (\r\n"
         "    \"%~dp0runtime\\python\\python.exe\" \"%~dp0host\\server\\run.py\" %*\r\n"
@@ -119,6 +121,8 @@ def write_batch_and_readme(pkg_dir: Path):
         "@echo off\r\n"
         "title STM32 RTT v3.0 All-In-One Launcher\r\n"
         "cd /d \"%~dp0\"\r\n"
+        "set PYTHONUTF8=1\r\n"
+        "set PYTHONIOENCODING=utf-8\r\n"
         "set \"PATH=%~dp0runtime\\openocd\\bin;%PATH%\"\r\n"
         "set CHIP_ID=h723\r\n"
         "if not \"%~1\"==\"\" set CHIP_ID=%~1\r\n"
@@ -130,13 +134,14 @@ def write_batch_and_readme(pkg_dir: Path):
         "if errorlevel 1 pause\r\n"
     )
     (pkg_dir / "2_一键启动全套.bat").write_bytes(bat2.encode("ascii"))
-    (pkg_dir / "一键启动全套(OpenOCD+网页端).bat").write_bytes(bat2.encode("ascii"))
     (pkg_dir / "start_all.bat").write_bytes(bat2.encode("ascii"))
 
     bat3 = (
         "@echo off\r\n"
         "title STM32 RTT v3.0 LAN Share Mode\r\n"
         "cd /d \"%~dp0\"\r\n"
+        "set PYTHONUTF8=1\r\n"
+        "set PYTHONIOENCODING=utf-8\r\n"
         "set \"PATH=%~dp0runtime\\openocd\\bin;%PATH%\"\r\n"
         "if exist \"%~dp0runtime\\python\\python.exe\" (\r\n"
         "    \"%~dp0runtime\\python\\python.exe\" \"%~dp0host\\server\\run.py\" --lan\r\n"
@@ -256,12 +261,16 @@ def main():
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         (dm / "scripts").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "scripts" / "openocd_rtt.py", dm / "scripts" / "openocd_rtt.py")
+        shutil.copy2(ROOT / "scripts" / "run_openocd.bat", dm / "scripts" / "run_openocd.bat")
         shutil.copy2(PKG_DIR / "RTT_Tuner.exe", dm / "RTT_Tuner.exe")
         shutil.copy2(PKG_DIR / "RTT_All_In_One.exe", dm / "RTT_All_In_One.exe")
+        shutil.copy2(PKG_DIR / "RTT_Tuner_LAN_Share.exe", dm / "RTT_Tuner_LAN_Share.exe")
         dm_bat_all = (
             "@echo off\r\n"
             "title STM32 RTT v3.0 Full Debug Suite Launcher\r\n"
             "cd /d \"%~dp0\"\r\n"
+            "set PYTHONUTF8=1\r\n"
+            "set PYTHONIOENCODING=utf-8\r\n"
             "if exist \"%~dp0host\\server\\run.py\" (\r\n"
             "    python \"%~dp0host\\server\\run.py\" --openocd %*\r\n"
             ") else if exist \"F:\\.gemini\\RTTproject\\host\\server\\run.py\" (\r\n"
@@ -272,12 +281,35 @@ def main():
             ")\r\n"
             "if errorlevel 1 pause\r\n"
         ).encode("ascii")
+        (dm / "2_一键启动全套.bat").write_bytes(dm_bat_all)
+        (dm / "start_all.bat").write_bytes(dm_bat_all)
         for p in dm.glob("*.bat"):
             if "一键启动" in p.name or p.name == "start_all.bat":
                 if "F103" in p.name:
                     p.write_bytes(dm_bat_all.replace(b"--openocd %*", b"--openocd --chip f103c8"))
                 else:
                     p.write_bytes(dm_bat_all)
+        # Update legacy run_openocd*.bat in DM_H7 to delegate to scripts/openocd_rtt.py (supports 3-ch 19021/19022/19023 + auto probe fallback)
+        ocd_map = {
+            "run_openocd.bat": "--chip h723",
+            "run_openocd_f103.bat": "--chip f103c8",
+            "run_openocd_f334.bat": "--chip f334",
+            "run_openocd_f4.bat": "--chip f407",
+            "run_openocd_g474.bat": "--chip g474",
+            "run_openocd_stlink_f103.bat": "--chip f103c8 --probe stlink",
+            "run_openocd_stlink_h7.bat": "--chip h723 --probe stlink",
+        }
+        for fname, default_args in ocd_map.items():
+            target_bat = dm / fname
+            if target_bat.exists():
+                content = (
+                    "@echo off\r\n"
+                    f"title OpenOCD 3-Channel RTT Server ({default_args})\r\n"
+                    "cd /d \"%~dp0\"\r\n"
+                    "set PYTHONUTF8=1\r\n"
+                    f"python \"%~dp0scripts\\openocd_rtt.py\" {default_args} --pause-on-error %*\r\n"
+                ).encode("ascii")
+                target_bat.write_bytes(content)
 
 
 if __name__ == "__main__":

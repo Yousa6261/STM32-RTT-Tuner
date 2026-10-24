@@ -50,8 +50,18 @@ def find_openocd_cmd() -> list:
     bundled = ROOT_DIR / "runtime" / "openocd" / "bin" / ("openocd.exe" if os.name == "nt" else "openocd")
     scripts = ROOT_DIR / "runtime" / "openocd" / "openocd" / "scripts"
     if bundled.exists():
-        return [str(bundled), "-s", str(scripts)] if scripts.exists() else [str(bundled)]
+        # 使用相对路径 runtime/openocd/openocd/scripts (配合 cwd=ROOT_DIR),
+        # 彻底规避含中文/空格/括号路径下 OpenOCD JimTcl 解析 -s 路径失败的问题。
+        return [str(bundled), "-s", "runtime/openocd/openocd/scripts"] if scripts.exists() else [str(bundled)]
     return ["openocd"]
+
+
+def _is_port_open(host: str = "127.0.0.1", port: int = 19021, timeout: float = 0.25) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 # 连接参数校验 (v3 P0 安全修复): openocd_target / openocd_ram 会被拼进 OpenOCD 的 Tcl 命令 (-c "..."),
 # 未校验时可注入任意 Tcl 语句。只接受下列格式。
@@ -812,62 +822,86 @@ class RTTManager:
                 except Exception as e:
                     return False, f"复用现有 OpenOCD 服务 (19021) 失败: {e}"
 
-            interface = "stlink" if mode == "stlink" else "cmsis-dap"
-            cmd = [
-                *find_openocd_cmd(),
-                "-f", f"interface/{interface}.cfg",
-                # 修复(B2a): stlink.cfg 不显式选择传输时默认 JTAG, SWD 接线必须显式声明
-                "-c", "transport select swd",
-            ]
-            cmd.extend([
-                "-f", f"target/{self.openocd_target}.cfg",
-                "-c", f"adapter speed {self.interface_speed}",
-                "-c", "init",
-                # 修复(B2b): RTT 扫描范围按芯片系列自适应, 防止越过 SRAM 边界触发 Bus Fault
-                "-c", f"rtt setup {self.openocd_ram} {self._rtt_scan_size()} {{SEGGER RTT}}",
-                "-c", "rtt start",
-                "-c", "rtt polling_interval 20",
-                "-c", "rtt server start 19021 0",
-                "-c", "rtt server start 19022 1",
-                "-c", "rtt server start 19023 2"
-            ])
-            try:
-                startupinfo = None
-                if os.name == 'nt':
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            if mode == "stlink":
+                iface_candidates = [["-f", "interface/stlink.cfg"]]
+            else:
+                # daplink 模式下优先使用标准 cmsis-dap，若不匹配则自动回退尝试 WCH-Link (0x1a86:0x8012/8011)
+                iface_candidates = [
+                    ["-f", "interface/cmsis-dap.cfg"],
+                    ["-f", "interface/cmsis-dap.cfg", "-c", "cmsis-dap vid_pid 0x1a86 0x8012 0x1a86 0x8011"],
+                ]
 
-                self.openocd_proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    startupinfo=startupinfo
-                )
-            except FileNotFoundError:
-                return False, "未找到 openocd 命令，请确保已安装 OpenOCD 并将其 bin 路径添加到环境变量 PATH 中。"
-            except Exception as e:
-                return False, f"启动 OpenOCD 失败: {str(e)}"
+            last_err_summary = "未知错误"
+            last_err_msg = ""
+            for iface_args in iface_candidates:
+                cmd = [
+                    *find_openocd_cmd(),
+                    *iface_args,
+                    # 修复(B2a): stlink.cfg 不显式选择传输时默认 JTAG, SWD 接线必须显式声明
+                    "-c", "transport select swd",
+                    "-f", f"target/{self.openocd_target}.cfg",
+                    "-c", f"adapter speed {self.interface_speed}",
+                    "-c", "init",
+                    # 修复(B2b): RTT 扫描范围按芯片系列自适应, 防止越过 SRAM 边界触发 Bus Fault
+                    "-c", f"rtt setup {self.openocd_ram} {self._rtt_scan_size()} {{SEGGER RTT}}",
+                    "-c", "rtt start",
+                    "-c", "rtt polling_interval 20",
+                    "-c", "rtt server start 19021 0",
+                    "-c", "rtt server start 19022 1",
+                    "-c", "rtt server start 19023 2",
+                ]
+                try:
+                    startupinfo = None
+                    if os.name == 'nt':
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            # 等待 OpenOCD 初始化
-            await asyncio.sleep(2.0)
+                    self.openocd_proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(ROOT_DIR),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        startupinfo=startupinfo
+                    )
+                except FileNotFoundError:
+                    return False, "未找到 openocd 命令，请确保已安装 OpenOCD 并将其 bin 路径添加到环境变量 PATH 中。"
+                except Exception as e:
+                    return False, f"启动 OpenOCD 失败: {str(e)}"
 
-            # 检查 OpenOCD 进程是否异常退出
-            if self.openocd_proc.poll() is not None:
+                # 动态轮询等待 OpenOCD 初始化 (最快 0.2s 即可响应，最慢等待 4.5s)
+                t_wait = time.monotonic()
+                port_ready = False
+                while time.monotonic() - t_wait < 4.5:
+                    if self.openocd_proc.poll() is not None:
+                        break
+                    if _is_port_open("127.0.0.1", 19021, timeout=0.2):
+                        port_ready = True
+                        break
+                    await asyncio.sleep(0.2)
+
+                if self.openocd_proc.poll() is None and port_ready:
+                    break
+
+                # 当前候选接口失败，收集输出信息
                 out = b""
                 try:
-                    out, _ = self.openocd_proc.communicate(timeout=1)
+                    if self.openocd_proc.poll() is None:
+                        self.openocd_proc.terminate()
+                    out, _ = self.openocd_proc.communicate(timeout=1.5)
                 except Exception:
                     pass
-                err_msg = out.decode('utf-8', errors='replace').strip()
-                err_summary = err_msg.splitlines()[-1] if err_msg else "未知错误"
-                # 修复(C2): 常见占用类失败给出可操作的排查指引
+                self.openocd_proc = None
+                last_err_msg = out.decode('utf-8', errors='replace').strip()
+                last_err_summary = last_err_msg.splitlines()[-1] if last_err_msg else "未知错误"
+
+            if self.openocd_proc is None or self.openocd_proc.poll() is not None:
                 hint = ""
-                _low = err_msg.lower()
+                _low = last_err_msg.lower()
                 if "unable to find" in _low or "open failed" in _low:
-                    hint = (" (常见原因: 调试器被占用 —— 请关闭 Keil 调试会话/其他 "
+                    hint = (" (常见原因: 调试器未插好或被占用 —— 请关闭 Keil 调试会话/其他 "
                             "OpenOCD 窗口, 拔插调试器后重试)")
                 await self.disconnect()
-                return False, f"OpenOCD 启动退出: {err_summary}{hint}"
+                return False, f"OpenOCD 启动退出: {last_err_summary}{hint}"
 
             # 尝试连接 OpenOCD 开辟的 RTT 端口 (19021)
             try:
@@ -1405,6 +1439,9 @@ class AppServer:
 
             if action == "get_status":
                 await ws.send_json(self.rtt.get_status())
+                if self.rtt.connected:
+                    await asyncio.sleep(0.05)
+                    await self.rtt.send_rtt("$GET:ALL\n")
 
             elif action == "connect":
                 mode = str(req.get("mode", "mock"))
@@ -1473,7 +1510,43 @@ def _get_lan_ip() -> str:
         return "127.0.0.1"
 
 
-async def main(allow_lan: bool = False):
+async def _auto_connect_openocd_task(server: AppServer, chip_id: str):
+    """当通过一键启动全套 (--openocd) 拉起服务，或启动时检测到 19021 已有 OpenOCD 时，
+    在后台等待 19021 端口就绪并自动建立连接，使浏览器打开即处于【已连接】状态。"""
+    chips = load_chips()
+    prof = chips.get(chip_id) or chips.get("h723") or {
+        "id": "h723", "part": "STM32H723VG", "openocd_target": "stm32h7x", "ram_base": "0x24000000"
+    }
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 8.0:
+        if server.rtt.connected:
+            return
+        if _is_port_open("127.0.0.1", 19021, timeout=0.25):
+            ok, msg = await server.rtt.connect(
+                mode="daplink",
+                target=prof["part"],
+                speed=1000,
+                host="127.0.0.1",
+                port=19021,
+                openocd_target=prof["openocd_target"],
+                openocd_ram=prof["ram_base"],
+                chip=prof["id"],
+            )
+            if ok:
+                print(f"  [AUTO] 已自动连接 127.0.0.1:19021 OpenOCD 服务 (chip={prof['id']})", flush=True)
+                await server.broadcast({
+                    "type": "connect_result",
+                    "success": True,
+                    "message": msg,
+                    "status": server.rtt.get_status(),
+                })
+                await asyncio.sleep(0.1)
+                await server.rtt.send_rtt("$GET:ALL\n")
+            return
+        await asyncio.sleep(0.4)
+
+
+async def main(allow_lan: bool = False, auto_openocd_chip: Optional[str] = None):
     global ALLOW_LAN
     if allow_lan or "--lan" in sys.argv:
         ALLOW_LAN = True
@@ -1483,8 +1556,18 @@ async def main(allow_lan: bool = False):
     bind_host = "0.0.0.0" if ALLOW_LAN else "127.0.0.1"
     server = AppServer(host=bind_host, port=8765, vofa_port=1347, vofa_text_port=1348)
     async_srv = await asyncio.start_server(server.handle_client, server.host, server.port)
-    vofa_srv = await asyncio.start_server(server.handle_vofa_client, server.host, server.vofa_port)
-    vofa_text_srv = await asyncio.start_server(server.handle_vofa_text_client, server.host, server.vofa_text_port)
+    active_servers = [async_srv]
+    try:
+        vofa_srv = await asyncio.start_server(server.handle_vofa_client, server.host, server.vofa_port)
+        active_servers.append(vofa_srv)
+    except OSError as e:
+        print(f"  [WARN] VOFA+ JustFloat 转发端口 {server.vofa_port} 已被占用 ({e})，已跳过该端口。")
+    try:
+        vofa_text_srv = await asyncio.start_server(server.handle_vofa_text_client, server.host, server.vofa_text_port)
+        active_servers.append(vofa_text_srv)
+    except OSError as e:
+        print(f"  [WARN] VOFA+ FireWater 转发端口 {server.vofa_text_port} 已被占用 ({e})，已跳过该端口。")
+
     print("=" * 68)
     print("  [OK] STM32 RTT 多通道物理隔离 Web & VOFA+ 网关就绪!")
     print(f"  * 本机 Web 控制台:   http://127.0.0.1:{server.port}")
@@ -1498,8 +1581,11 @@ async def main(allow_lan: bool = False):
     print("  * 硬件连接支持:      DAP-Link / ST-Link / J-Link / Telnet / Mock 仿真")
     print("=" * 68)
     sys.stdout.flush()
-    async with async_srv, vofa_srv, vofa_text_srv:
-        await asyncio.gather(async_srv.serve_forever(), vofa_srv.serve_forever(), vofa_text_srv.serve_forever())
+
+    if auto_openocd_chip or _is_port_open("127.0.0.1", 19021, timeout=0.15):
+        asyncio.create_task(_auto_connect_openocd_task(server, auto_openocd_chip or "h723"))
+
+    await asyncio.gather(*(srv.serve_forever() for srv in active_servers))
 
 
 if __name__ == "__main__":

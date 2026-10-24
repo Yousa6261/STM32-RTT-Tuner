@@ -205,6 +205,9 @@
       switch (msg.type) {
         case 'status':
           updateConnectionStatus(msg);
+          if (msg.connected && window.RTTCapturePanel && typeof window.RTTCapturePanel.onConnected === 'function') {
+            window.RTTCapturePanel.onConnected();
+          }
           break;
 
         case 'connect_result':

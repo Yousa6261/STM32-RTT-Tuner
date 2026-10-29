@@ -253,10 +253,23 @@ def _peer_is_lan(writer) -> bool:
         return False
 
 
+def _set_tcp_nodelay(writer, sndbuf: Optional[int] = None) -> None:
+    """开启 TCP_NODELAY 消除 Nagle 拼包延迟; 可选限制 SO_SNDBUF 防止慢客户端积压多秒旧帧。"""
+    try:
+        sock = writer.get_extra_info("socket") if writer is not None else None
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if sndbuf is not None and sndbuf > 0:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(sndbuf))
+    except Exception:
+        pass
+
+
 class WSConnection:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
         self.writer = writer
+        _set_tcp_nodelay(writer)
         self.closed = False
         # v3.1: Ch1 波形推送方式。None = 旧版 JSON (未订阅的旧网页/脚本客户端, 保持兼容);
         #       'full' = 二进制全速 (不抽取); 'decim' = 二进制 + 分段 min/max 抽取 (局域网默认)
@@ -710,6 +723,7 @@ class RTTManager:
         while self.connected:
             try:
                 reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 3.0)
+                _set_tcp_nodelay(writer)
             except Exception as e:
                 if announced is not False:
                     await self.broadcast({"type": "wave_status", "connected": False,
@@ -949,7 +963,7 @@ class RTTManager:
                     # 修复(B2b): RTT 扫描范围按芯片系列自适应, 防止越过 SRAM 边界触发 Bus Fault
                     "-c", f"rtt setup {self.openocd_ram} {self._rtt_scan_size()} {{SEGGER RTT}}",
                     "-c", "rtt start",
-                    "-c", "rtt polling_interval 20",
+                    "-c", "rtt polling_interval 10",
                     "-c", "rtt server start 19021 0",
                     "-c", "rtt server start 19022 1",
                     "-c", "rtt server start 19023 2",
@@ -1321,6 +1335,7 @@ class AppServer:
         self.rtt.wave_sink = self.broadcast_wave
 
     JF_MAX_PENDING = 512 * 1024   # 单个 VOFA+ 客户端发送积压上限, 超出视为卡死并断开, 避免拖慢网页波形
+    JF_DROP_WATERMARK = 4096      # VOFA+ UI 渲染慢于接收速率时跳过整批帧, 防止 TCP 缓冲积压出几秒延迟
     # 局域网 (decim) 订阅: 单条消息超过该帧数才做 min/max 抽取 (每 25ms 一条 → 约 10 k帧/s 以上才抽取)
     WAVE_LAN_MAX_FRAMES = 250
 
@@ -1359,9 +1374,13 @@ class AppServer:
                 if w.is_closing():
                     self.jf_clients.discard(w)
                     continue
-                if w.transport.get_write_buffer_size() > self.JF_MAX_PENDING:
+                pending_sz = w.transport.get_write_buffer_size()
+                if pending_sz > self.JF_MAX_PENDING:
                     self.jf_clients.discard(w)
                     w.close()
+                    continue
+                if pending_sz > self.JF_DROP_WATERMARK:
+                    # raw 是完整帧对齐的批次, 整批跳过既不破坏 JustFloat 帧边界, 又能防止 VOFA+ 积压出几秒延迟
                     continue
                 w.write(raw)
             except Exception:
@@ -1441,6 +1460,7 @@ class AppServer:
         await self._serve_vofa(reader, writer, self.vofa_clients)
 
     async def _serve_vofa(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, pool: set):
+        _set_tcp_nodelay(writer, sndbuf=8192)
         pool.add(writer)
         try:
             while True:

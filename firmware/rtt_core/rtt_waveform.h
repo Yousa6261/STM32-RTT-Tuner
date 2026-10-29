@@ -44,6 +44,14 @@ extern "C" {
 /** @brief 单帧最多支持打包的曲线通道数 (16 路 float 足以覆盖绝大多数电机/机器人整机调试) */
 #define RTT_WAVEFORM_MAX_CHANNELS        16
 
+/** @brief 防积压水位门限 (字节, Anti-Bufferbloat):
+ *  OpenOCD 每次轮询单通道最多读取 1024 字节 (RTT_CHANNEL_BUFFER_SIZE=1024)。
+ *  限制未读积压不超过 1024B，既跑满每次轮询的 1024B 带宽，又彻底消除 4KB 缓冲排满时的数百毫秒历史延迟。
+ *  若使用有线 J-Link 超高吞吐模式，可在编译器全局宏定义 RTT_WAVEFORM_MAX_BACKLOG=4096。 */
+#ifndef RTT_WAVEFORM_MAX_BACKLOG
+#define RTT_WAVEFORM_MAX_BACKLOG         1024
+#endif
+
 
 /* ============================================================================ */
 /* 初始化接口 API                                                               */
@@ -111,6 +119,35 @@ int RTT_Send_JustFloat_4Ch(float ch1, float ch2, float ch3, float ch4);
  * @param  ch1 ~ ch6 分别对应 VOFA+ !0 ~ !5
  */
 int RTT_Send_JustFloat_6Ch(float ch1, float ch2, float ch3, float ch4, float ch5, float ch6);
+
+/**
+ * @brief  便捷发送接口：直接向默认 Channel 1 发送 8 路浮点波形
+ */
+int RTT_Send_JustFloat_8Ch(float ch1, float ch2, float ch3, float ch4,
+                           float ch5, float ch6, float ch7, float ch8);
+
+/**
+ * @brief  便捷发送接口：直接向默认 Channel 1 发送 10 路浮点波形
+ */
+int RTT_Send_JustFloat_10Ch(float ch1, float ch2, float ch3, float ch4, float ch5,
+                            float ch6, float ch7, float ch8, float ch9, float ch10);
+
+/**
+ * @brief  便捷发送接口：直接向默认 Channel 1 发送 12 路浮点波形
+ */
+int RTT_Send_JustFloat_12Ch(float ch1, float ch2, float ch3, float ch4, float ch5, float ch6,
+                            float ch7, float ch8, float ch9, float ch10, float ch11, float ch12);
+
+/**
+ * @brief  自适应任意通道数宏 (1 ~ 16 路自动推导通道数并单次原子发送至默认 Channel 1)
+ * @note   用法示例: RTT_SEND_JUSTFLOAT(sins, coss, target, actual, err, ia, ib, vbus);
+ */
+#define RTT_SEND_JUSTFLOAT(...) \
+    do { \
+        const float _rtt_jf_arr_[] = { __VA_ARGS__ }; \
+        RTT_Send_JustFloat(RTT_WAVEFORM_DEFAULT_CHANNEL, _rtt_jf_arr_, \
+                           (uint8_t)(sizeof(_rtt_jf_arr_) / sizeof(float))); \
+    } while (0)
 
 #ifdef __cplusplus
 }

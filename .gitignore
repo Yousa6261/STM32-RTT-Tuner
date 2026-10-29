@@ -29,4 +29,5 @@ captures/
 recordings/
 dist/
 runtime/
+TESTs/hw/shots/
 *.log

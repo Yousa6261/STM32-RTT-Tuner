@@ -78,6 +78,28 @@ int RTT_Send_JustFloat(uint8_t channel, const float *data, uint8_t count) {
     uint8_t frame_buf[RTT_WAVEFORM_MAX_CHANNELS * sizeof(float) + 4];
     uint8_t send_count = (count > RTT_WAVEFORM_MAX_CHANNELS) ? RTT_WAVEFORM_MAX_CHANNELS : count;
     size_t payload_bytes = send_count * sizeof(float);
+    size_t total_bytes = payload_bytes + 4;
+
+#if defined(RTT_WAVEFORM_MAX_BACKLOG) && (RTT_WAVEFORM_MAX_BACKLOG > 0)
+    /*
+     * 防积压水位门限 (Anti-Bufferbloat):
+     * OpenOCD 每次轮询单通道最多读取 1024B (RTT_CHANNEL_BUFFER_SIZE=1024)。
+     * 限制未读积压不超过 RTT_WAVEFORM_MAX_BACKLOG，既保证每次轮询喂满 1024B 带宽，
+     * 又防止发送速率超过无线 SWD 带宽时在 4KB 环形缓冲中积压数百毫秒的陈旧帧。
+     */
+    {
+        const SEGGER_RTT_BUFFER_UP *pRing = &_SEGGER_RTT.aUp[channel];
+        unsigned sz = pRing->SizeOfBuffer;
+        if (sz > 0u) {
+            unsigned wr = pRing->WrOff;
+            unsigned rd = pRing->RdOff;
+            unsigned used = (wr >= rd) ? (wr - rd) : (sz - rd + wr);
+            if (used + (unsigned)total_bytes > (unsigned)RTT_WAVEFORM_MAX_BACKLOG) {
+                return 0;
+            }
+        }
+    }
+#endif
 
     /* 1. 内存拷贝单精度浮点数据 (硬件直接小端对齐，零 CPU 转换耗时) */
     memcpy(frame_buf, data, payload_bytes);
@@ -86,7 +108,7 @@ int RTT_Send_JustFloat(uint8_t channel, const float *data, uint8_t count) {
     memcpy(frame_buf + payload_bytes, s_justfloat_tail, 4);
 
     /* 3. 单次原子写入 RTT 对应通道环形缓冲区 */
-    return (int)SEGGER_RTT_Write((unsigned)channel, frame_buf, (unsigned)(payload_bytes + 4));
+    return (int)SEGGER_RTT_Write((unsigned)channel, frame_buf, (unsigned)total_bytes);
 }
 
 int RTT_Send_JustFloat_2Ch(float ch1, float ch2) {
@@ -107,4 +129,22 @@ int RTT_Send_JustFloat_4Ch(float ch1, float ch2, float ch3, float ch4) {
 int RTT_Send_JustFloat_6Ch(float ch1, float ch2, float ch3, float ch4, float ch5, float ch6) {
     float buf[6] = { ch1, ch2, ch3, ch4, ch5, ch6 };
     return RTT_Send_JustFloat(RTT_WAVEFORM_DEFAULT_CHANNEL, buf, 6);
+}
+
+int RTT_Send_JustFloat_8Ch(float ch1, float ch2, float ch3, float ch4,
+                           float ch5, float ch6, float ch7, float ch8) {
+    float buf[8] = { ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8 };
+    return RTT_Send_JustFloat(RTT_WAVEFORM_DEFAULT_CHANNEL, buf, 8);
+}
+
+int RTT_Send_JustFloat_10Ch(float ch1, float ch2, float ch3, float ch4, float ch5,
+                            float ch6, float ch7, float ch8, float ch9, float ch10) {
+    float buf[10] = { ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, ch9, ch10 };
+    return RTT_Send_JustFloat(RTT_WAVEFORM_DEFAULT_CHANNEL, buf, 10);
+}
+
+int RTT_Send_JustFloat_12Ch(float ch1, float ch2, float ch3, float ch4, float ch5, float ch6,
+                            float ch7, float ch8, float ch9, float ch10, float ch11, float ch12) {
+    float buf[12] = { ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, ch9, ch10, ch11, ch12 };
+    return RTT_Send_JustFloat(RTT_WAVEFORM_DEFAULT_CHANNEL, buf, 12);
 }

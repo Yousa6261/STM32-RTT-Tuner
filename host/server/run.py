@@ -67,7 +67,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="STM32 SEGGER RTT v3.0 Web Tuner & Analyzer Launcher")
     ap.add_argument("--openocd", action="store_true", help="Start OpenOCD RTT server in a separate console window")
     ap.add_argument("--chip", default="h723", help="Target chip ID for OpenOCD (default: h723)")
-    ap.add_argument("--poll", type=int, default=20, help="OpenOCD RTT polling interval in ms (default: 20)")
+    ap.add_argument("--poll", type=int, default=10, help="OpenOCD RTT polling interval in ms (default: 10)")
     ap.add_argument("--lan", action="store_true", help="Enable LAN sharing mode (0.0.0.0:8765)")
     ap.add_argument("--no-browser", action="store_true", help="Do not auto-open browser")
     args, _ = ap.parse_known_args()

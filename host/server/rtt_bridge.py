@@ -23,6 +23,7 @@ import struct
 import math
 import mimetypes
 import subprocess
+from array import array
 from collections import deque
 from pathlib import Path
 from typing import Set, Optional, Dict, Any
@@ -155,8 +156,9 @@ def make_ws_handshake_response(key: str) -> bytes:
     return response.encode('ascii')
 
 
-def encode_ws_frame(message: str, opcode: int = 0x1) -> bytes:
-    payload = message.encode('utf-8')
+def encode_ws_frame(message, opcode: int = 0x1) -> bytes:
+    """message: str (文本帧, opcode 0x1) 或 bytes (二进制帧需传 opcode=0x2)"""
+    payload = message.encode('utf-8') if isinstance(message, str) else bytes(message)
     length = len(payload)
     header = bytearray()
     header.append(0x80 | opcode)  # FIN = 1
@@ -173,11 +175,93 @@ def encode_ws_frame(message: str, opcode: int = 0x1) -> bytes:
     return bytes(header) + payload
 
 
+# ---------------------------------------------------------------------------
+# v3.1 Ch1 二进制波形帧 (网页订阅 wave_subscribe{format:"bin"} 后改用此格式推送)
+# 布局 (小端): u8 kind=1 | u8 nch | u16 decim | u32 nframes | f32 fps | u32 resync | f32[nframes*nch] 行优先
+# 相比 JSON: 免去逐值 float(f"{v:.7g}") 格式化与浏览器 JSON.parse, NaN/Inf 原样传递 (无需转 null)。
+# ---------------------------------------------------------------------------
+WAVE_BIN_KIND = 1
+WAVE_BIN_HEADER = struct.Struct('<BBHIfI')
+
+
+def minmax_decimate(rows: list, max_out: int):
+    """分段 min/max 抽取: 每 2*decim 帧输出 2 帧 (各通道按先后顺序放置该段的极小/极大值),
+    尖峰与毛刺不会像等间隔抽点那样被漏掉。返回 (rows_out, decim)。"""
+    n = len(rows)
+    if max_out < 2 or n <= max_out:
+        return rows, 1
+    decim = -(-n // max_out)            # ceil(n / max_out)
+    bucket = 2 * decim
+    nch = len(rows[0])
+    out = []
+    nan = float("nan")
+    for s in range(0, n, bucket):
+        seg = rows[s:s + bucket]
+        r_first, r_second = [nan] * nch, [nan] * nch
+        for c in range(nch):
+            lo = hi = None
+            ilo = ihi = 0
+            for k, fr in enumerate(seg):
+                v = fr[c]
+                if v - v != 0:          # NaN / Inf
+                    continue
+                if lo is None or v < lo:
+                    lo, ilo = v, k
+                if hi is None or v > hi:
+                    hi, ihi = v, k
+            if lo is not None:
+                if ilo <= ihi:
+                    r_first[c], r_second[c] = lo, hi
+                else:
+                    r_first[c], r_second[c] = hi, lo
+        out.append(r_first)
+        out.append(r_second)
+    return out, decim
+
+
+def encode_wave_binary(frames: list, fps: float, resync: int, max_frames: Optional[int] = None) -> Optional[bytes]:
+    """把 JustFloat 帧列表编码为二进制波形帧; max_frames 给定时超出部分做 min/max 抽取 (局域网模式)。"""
+    if not frames:
+        return None
+    nch = len(frames[-1])
+    if not (1 <= nch <= 32):
+        return None
+    rows = [f for f in frames if len(f) == nch]
+    decim = 1
+    if max_frames:
+        rows, decim = minmax_decimate(rows, max_frames)
+    arr = array('f', (v for fr in rows for v in fr))
+    if sys.byteorder != 'little':
+        arr.byteswap()
+    header = WAVE_BIN_HEADER.pack(WAVE_BIN_KIND, nch, min(decim, 65535), len(rows), float(fps or 0.0),
+                                  int(resync) & 0xFFFFFFFF)
+    return header + arr.tobytes()
+
+
+def _peer_is_lan(writer) -> bool:
+    """WebSocket 客户端是否来自非回环地址 (局域网共享模式下的同伴设备)"""
+    try:
+        import ipaddress
+        peer = writer.get_extra_info('peername')
+        if not peer:
+            return False
+        ip = ipaddress.ip_address(str(peer[0]).split('%')[0])
+        if getattr(ip, 'ipv4_mapped', None):
+            ip = ip.ipv4_mapped
+        return not ip.is_loopback
+    except Exception:
+        return False
+
+
 class WSConnection:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
         self.writer = writer
         self.closed = False
+        # v3.1: Ch1 波形推送方式。None = 旧版 JSON (未订阅的旧网页/脚本客户端, 保持兼容);
+        #       'full' = 二进制全速 (不抽取); 'decim' = 二进制 + 分段 min/max 抽取 (局域网默认)
+        self.wave_mode: Optional[str] = None
+        self.is_lan = _peer_is_lan(writer)
 
     async def send_text(self, text: str):
         if self.closed:
@@ -185,6 +269,15 @@ class WSConnection:
         try:
             frame = encode_ws_frame(text)
             self.writer.write(frame)
+            await self.writer.drain()
+        except Exception:
+            self.closed = True
+
+    async def send_bytes(self, data: bytes):
+        if self.closed:
+            return
+        try:
+            self.writer.write(encode_ws_frame(data, opcode=0x2))
             await self.writer.drain()
         except Exception:
             self.closed = True
@@ -482,6 +575,8 @@ class RTTManager:
         self.ch1_task: Optional[asyncio.Task] = None
         # v3 P2: Ch2 触发采集接收任务 (OpenOCD 19023 / telnet 端口+2 / 仿真)
         self.ch2_task: Optional[asyncio.Task] = None
+        # v3.1: 波形分发回调 async (frames, fps, decoder); None 时按旧版 JSON 经 broadcast 推送
+        self.wave_sink = None
         self.mock_capture = MockCapture(lambda k: self.mock_engine.params[k]["val"])
         self.cap_stats = {"captures": 0, "errors": 0, "crc_errors": 0}
 
@@ -586,12 +681,21 @@ class RTTManager:
     async def _flush_wave(self, frames: list, fps: float, dec: "JustFloatDecoder"):
         if not frames:
             return
-        stride = max(1, -(-len(frames) // self.MAX_WAVE_FRAMES_PER_MSG))
+        # v3.1: 由 AppServer 按客户端订阅方式分发 (二进制全速 / 二进制抽取 / 旧版 JSON)
+        if self.wave_sink is not None:
+            await self.wave_sink(frames, fps, dec)
+            return
+        await self.broadcast(self.wave_json(frames, fps, dec))
+
+    @classmethod
+    def wave_json(cls, frames: list, fps: float, dec: "JustFloatDecoder") -> dict:
+        """旧版 JSON 波形消息 (等间隔抽取到 MAX_WAVE_FRAMES_PER_MSG 帧以内)"""
+        stride = max(1, -(-len(frames) // cls.MAX_WAVE_FRAMES_PER_MSG))
         sel = frames[::stride]
         nch = len(sel[-1])
         # JSON 不允许 NaN/Infinity (浏览器 JSON.parse 会整条报错), 非有限值替换为 null
         rows = [[float(f"{v:.7g}") if math.isfinite(v) else None for v in fr] for fr in sel if len(fr) == nch]
-        await self.broadcast({
+        return {
             "type": "wave",
             "nch": nch,
             "frames": rows,
@@ -599,7 +703,7 @@ class RTTManager:
             "decim": stride,
             "resync": dec.resync_count,
             "timestamp": time.time()
-        })
+        }
 
     async def _ch1_rx_loop(self, host: str, port: int):
         announced = None
@@ -1214,8 +1318,39 @@ class AppServer:
         self.vofa_clients: Set[asyncio.StreamWriter] = set()      # FireWater 文本客户端 (1348)
         self.jf_clients: Set[asyncio.StreamWriter] = set()        # JustFloat 二进制客户端 (1347)
         self.rtt = RTTManager(self.broadcast, self.forward_ch1_frames)
+        self.rtt.wave_sink = self.broadcast_wave
 
     JF_MAX_PENDING = 512 * 1024   # 单个 VOFA+ 客户端发送积压上限, 超出视为卡死并断开, 避免拖慢网页波形
+    # 局域网 (decim) 订阅: 单条消息超过该帧数才做 min/max 抽取 (每 25ms 一条 → 约 10 k帧/s 以上才抽取)
+    WAVE_LAN_MAX_FRAMES = 250
+
+    async def broadcast_wave(self, frames: list, fps: float, dec: "JustFloatDecoder"):
+        """按每个网页客户端的订阅方式推送 Ch1 波形; 每种格式每批只编码一次。"""
+        if not self.clients or not frames:
+            return
+        cache: Dict[str, Any] = {}
+        dead = []
+        for ws in list(self.clients):
+            if ws.closed:
+                dead.append(ws)
+                continue
+            mode = ws.wave_mode
+            try:
+                if mode is None:
+                    if "json" not in cache:
+                        cache["json"] = json.dumps(self.rtt.wave_json(frames, fps, dec), ensure_ascii=False)
+                    await ws.send_text(cache["json"])
+                else:
+                    if mode not in cache:
+                        cache[mode] = encode_wave_binary(
+                            frames, fps, dec.resync_count,
+                            max_frames=self.WAVE_LAN_MAX_FRAMES if mode == "decim" else None)
+                    if cache[mode]:
+                        await ws.send_bytes(cache[mode])
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.clients.discard(ws)
 
     def forward_ch1_frames(self, raw: bytes):
         """由 RTTManager 的 Ch1 接收任务调用 (同步、不等待 drain): 把 JustFloat 帧写给 1347 客户端"""
@@ -1418,6 +1553,8 @@ class AppServer:
                 f"Content-Type: {mime_type}; charset=utf-8\r\n"
                 f"Content-Length: {len(content)}\r\n"
                 f"Access-Control-Allow-Origin: *\r\n"
+                # v3.1: 升级后避免浏览器混用缓存的旧 app.js 与新 index.html (每次协商, 304 不适用时重新下载)
+                f"Cache-Control: no-cache\r\n"
                 f"Connection: close\r\n\r\n"
             ).encode('ascii')
             writer.write(header + content)
@@ -1484,6 +1621,18 @@ class AppServer:
 
             elif action == "ping":
                 await self.rtt.send_rtt("$PING\n")
+
+            elif action == "wave_subscribe":
+                # v3.1: format="bin" → 二进制波形; full 未指定时按来源自动选择 (本机全速 / 局域网抽取)
+                if req.get("format") == "bin":
+                    full = req.get("full")
+                    if not isinstance(full, bool):
+                        full = not ws.is_lan
+                    ws.wave_mode = "full" if full else "decim"
+                else:
+                    ws.wave_mode = None
+                await ws.send_json({"type": "wave_subscribed", "mode": ws.wave_mode or "json",
+                                    "lan": ws.is_lan, "lan_max_frames": self.WAVE_LAN_MAX_FRAMES})
 
         except Exception as e:
             await ws.send_json({"type": "error", "message": f"处理请求错误: {str(e)}"})

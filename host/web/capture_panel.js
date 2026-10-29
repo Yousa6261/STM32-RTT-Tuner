@@ -431,6 +431,14 @@
     const sel = els['cap-history'];
     if (!sel) return;
     sel.textContent = '';
+    if (!state.history.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '(无采集)';
+      sel.appendChild(opt);
+      sel.value = '';
+      return;
+    }
     state.history.forEach((c, idx) => {
       const opt = document.createElement('option');
       opt.value = String(idx);
@@ -438,6 +446,24 @@
       sel.appendChild(opt);
     });
     sel.value = '0';
+  }
+
+  /** v3.1: 清空采集记录与画布 (波形面板 "全部清空" 调用) */
+  function clearHistory() {
+    state.history = [];
+    state.current = null;
+    state.lastStepResult = null;
+    state.lastFftResult = null;
+    state.lastStftResult = null;
+    rebuildHistorySelect();
+    drawCaptureCanvas();
+    ['fftCanvas', 'stftCanvas'].forEach(id => {
+      const cv = els[id];
+      if (cv && cv.getContext) cv.getContext('2d').clearRect(0, 0, cv.width, cv.height);
+    });
+    ['step-result', 'fft-result', 'stft-result'].forEach(id => { if (els[id]) els[id].textContent = ''; });
+    if (els['cap-legend']) els['cap-legend'].textContent = '';
+    if (els['cap-status']) els['cap-status'].textContent = '已清空';
   }
 
   function selectCapture(cap) {
@@ -1180,6 +1206,7 @@
     onAck,
     onCapture,
     importCh1Snapshot,
+    clearHistory,
     runStepAnalysis,
     runFftAnalysis,
     runStftAnalysis,

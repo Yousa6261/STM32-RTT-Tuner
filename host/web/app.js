@@ -152,14 +152,17 @@
 
     try {
       ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';   // v3.1: Ch1 波形以二进制帧推送
 
       ws.onopen = () => {
         logTerminal('system', '✅ WebSocket 网关已成功握手');
+        waveSubscribe();
         sendJson({ type: 'get_status' });
       };
 
       ws.onmessage = (event) => {
-        handleServerMessage(event.data);
+        if (typeof event.data === 'string') handleServerMessage(event.data);
+        else handleWaveBinary(event.data);
       };
 
       ws.onclose = () => {
@@ -213,6 +216,7 @@
         case 'connect_result':
           logTerminal(msg.success ? 'system' : 'ack-err', msg.message);
           if (msg.status) updateConnectionStatus(msg.status);
+          if (msg.success && msg.status && msg.status.connected) waveOnConnected();
           if (msg.success && window.RTTCapturePanel && typeof window.RTTCapturePanel.onConnected === 'function') {
             window.RTTCapturePanel.onConnected();
           }
@@ -233,6 +237,7 @@
 
         case 'ack':
           handleAckMessage(msg);
+          waveOnAck(msg);
           break;
 
         case 'pong':
@@ -261,6 +266,12 @@
 
         case 'wave':
           handleWave(msg);
+          break;
+
+        case 'wave_subscribed':
+          wave.sub = msg;
+          updateWaveInfo();
+          if (wave.settingsOpen) buildWaveSettingsPanel();
           break;
 
         case 'wave_status':
@@ -1041,24 +1052,95 @@
     requestAnimationFrame(draw);
   }
 
-  // ================= Ch1 JustFloat 波形 (2026-10-23 新增) =================
-  // 数据来源: 网关读取 OpenOCD 19022 (RTT Channel 1) 并解码 JustFloat; VOFA+ 同时直连 19022, 两边同源。
-  // 网关每 25ms 推送一批帧, 帧多时等间隔抽取 (msg.decim), 因此网页用于观察趋势, 全速细节以 VOFA+ 为准。
-  // x 轴按样本序号: 时间窗 = windowSec × displayRate 个样本 (displayRate 为平滑后的 fps / decim)。
+  // ================= Ch1 JustFloat 波形 (v3.1 重构) =================
+  // 数据来源: 网关读取 OpenOCD 19022 (RTT Channel 1) 并解码 JustFloat; VOFA+ 同时直连 19022 / 网关 1347, 两边同源。
+  // v3.1: 网页订阅二进制帧 (本机全速不抽取 / 局域网 min-max 抽取); 旧版 JSON 'wave' 消息仍兼容。
+  // 数据层与渲染器在 wave_core.js (不依赖 DOM, 将来可原样放进 Web Worker), 本段负责界面、交互、设置:
+  //   - 实时跟随 / 历史浏览 状态机: 暂停只是停止跟随, 浏览时仍可拖拽、缩放、读数; 新数据在后台继续写入
+  //   - 三层画布: 网格层 (几乎静止) / 波形层 (有新数据或视图变化才重绘) / 交互层 (十字光标、框选)
+  //   - 叠加 / 分图 / 自定义分组, 所有子图共用横轴; 每个子图纵轴独立 (分通道铺满 / 共用自动 / 手动 / 对称)
+  const WC = (typeof window !== 'undefined' && window.RTTWaveCore) || null;
   const WAVE_COLORS = ['#58a6ff', '#3fb950', '#d29922', '#f778ba', '#a371f7', '#39c5bb', '#f85149', '#e6edf3'];
-  const WAVE_MAX_SAMPLES = 20000;
   const WAVE_NAMES_KEY = 'ch1WaveNames';
+  const WAVE_SETTINGS_KEY = 'ch1WaveSettings';
   // 平滑播放参数 (FIX-024 调整): 曲线右端比最新样本滞后约 WAVE_PLAY_LAG_S。
   // 无线 OpenOCD 轮询间隔实测 100~260ms, 滞后取 0.15s 时, 间隔不超过约 0.2s 就不会出现"停住等数据"。
   // 代价: 曲线比图例数值晚约 0.15s 显示。积压超过 WAVE_PLAY_RESET_S (如暂停后恢复) 直接跳到最新。
+  // v3.1: 设置中可关闭"平滑滚动", 右端直接对齐最新样本 (延迟最低, 但成批到达时会一顿一顿)。
   const WAVE_PLAY_LAG_S = 0.15;
   const WAVE_PLAY_RESET_S = 0.6;
-  const wave = {
-    nch: 0, ch: [], names: [], visible: [], valEls: [], nameEls: [],
-    paused: false, windowSec: 2, fps: 0, displayRate: 0, rateJumpCount: 0, decim: 1, resync: 0, scaleMode: 'per',
-    playhead: 0, lastDrawTs: 0, lastRx: 0,
-    lastLegendUpdate: 0, canvas: null, ctx: null
+  const WAVE_MEM_LIMIT = 200 * 1024 * 1024;    // 历史缓存内存上限
+  const WAVE_MAX_MARKERS = 300;
+  const WAVE_ANALYSIS_MAX = 262144;            // 送入分析的最大点数 (更长时取区间内最新的这么多点)
+  const WAVE_OVERVIEW_H = 36;
+  const WAVE_HISTORY_PRESETS = [10, 30, 60, 120, 300];
+  const WAVE_WINDOW_PRESETS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60];
+  const WAVE_DEFAULTS = {
+    xMode: 'time', windowSec: 2, points: 2000, historySec: 60,
+    layout: 'overlay', groups: [], yCfg: {}, fpsCap: 60, transport: 'auto',
+    markers: true, clearOnConnect: false, smooth: true, wide: false, height: 0
   };
+
+  const wave = {
+    nch: 0, names: [], visible: [], valEls: [], nameEls: [], last: null,
+    store: null, axis: null, capInfo: null,
+    mode: 'live', view: null, lastView: null, undo: [], lastUndoTs: 0,
+    fps: 0, displayRate: 0, rateJumpCount: 0, decim: 1, resync: 0, resyncBase: 0, sub: null,
+    playhead: 0, lastDrawTs: 0, lastRx: 0, lastLegendUpdate: 0, lastCapCheck: 0, lastFrameTs: 0,
+    cursors: { a: null, b: null }, markers: [], ackVals: {},
+    hover: null, hoverStage: false, drag: null, select: null, ovDrag: null, ovInfo: null,
+    yState: {}, yView: {}, plots: [], tickStep: 0,
+    settings: null, settingsOpen: false,
+    stage: null, layers: null, overview: null, cssW: 0, cssH: 0, dpr: 1, stageW: 0,
+    dirty: true, overlayDirty: false, layoutSig: '', gridSig: '', ovLast: 0, colBuf: null,
+    perf: { hist: [], ms: 0, p95: 0, vertices: 0, gridDraws: 0, frames: 0 },
+    ui: {}, lastReadout: 0, lastSettingsRefresh: 0, homeParent: null, homeNext: null
+  };
+
+  // ---- 外部依赖 (typeof 保护: 本段在单元测试中会被单独抽取运行) ----
+  function waveLog(type, text) { if (typeof logTerminal === 'function') logTerminal(type, text); }
+  function waveSendRtt(raw) { if (typeof sendRttCommand === 'function') sendRttCommand(raw); }
+  function waveSendJson(obj) { if (typeof sendJson === 'function') sendJson(obj); }
+  function waveParamMeta(name) {
+    try { return (typeof dynamicParams !== 'undefined' && dynamicParams.get(name)) || null; } catch (e) { return null; }
+  }
+  const waveNow = () => performance.now();
+  const clampNum = (v, lo, hi, dflt) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : dflt; };
+
+  // ---------------------------------------------------------------- 设置持久化
+  function loadWaveSettings() {
+    let s = {};
+    try { s = JSON.parse(localStorage.getItem(WAVE_SETTINGS_KEY) || '{}') || {}; } catch (e) { s = {}; }
+    const d = WAVE_DEFAULTS;
+    const yCfg = {};
+    if (s.yCfg && typeof s.yCfg === 'object') {
+      Object.keys(s.yCfg).forEach(k => {
+        const c = s.yCfg[k] || {};
+        yCfg[k] = { mode: ['per', 'auto', 'manual', 'sym'].includes(c.mode) ? c.mode : 'per',
+                    min: Number(c.min) || 0, max: Number(c.max) || 0, sym: Math.abs(Number(c.sym) || 0) };
+      });
+    }
+    return {
+      xMode: s.xMode === 'points' ? 'points' : 'time',
+      windowSec: clampNum(s.windowSec, 0.01, 3600, d.windowSec),
+      points: Math.round(clampNum(s.points, 10, 5e6, d.points)),
+      historySec: clampNum(s.historySec, 1, 3600, d.historySec),
+      layout: ['overlay', 'split', 'custom'].includes(s.layout) ? s.layout : d.layout,
+      groups: Array.isArray(s.groups) ? s.groups.map(g => Math.max(1, Math.min(8, Number(g) | 0 || 1))) : [],
+      yCfg,
+      fpsCap: [15, 30, 60].includes(s.fpsCap) ? s.fpsCap : d.fpsCap,
+      transport: ['auto', 'full', 'decim'].includes(s.transport) ? s.transport : d.transport,
+      markers: s.markers !== false,
+      clearOnConnect: s.clearOnConnect === true,
+      smooth: s.smooth !== false,
+      wide: s.wide === true,
+      height: Math.round(clampNum(s.height, 0, 2000, 0))
+    };
+  }
+
+  function saveWaveSettings() {
+    try { localStorage.setItem(WAVE_SETTINGS_KEY, JSON.stringify(wave.settings)); } catch (e) { /* 隐私模式等 */ }
+  }
 
   function loadWaveNames() {
     try {
@@ -1083,75 +1165,141 @@
     if (wave.nameEls[i]) wave.nameEls[i].textContent = wave.names[i];
     saveWaveNames();
     syncCh1Keys();
+    rebuildWaveTip();
+    if (wave.settingsOpen) buildWaveSettingsPanel();
     // 立即用最新一帧刷新看板, 不必等下一批数据
-    if (wave.ch.length && wave.ch[0].length) {
-      pushCh1ToDashboard(wave.ch.map(a => a[a.length - 1]), true);
+    if (Array.isArray(wave.last)) {
+      pushCh1ToDashboard(wave.last, true);
       flushTelemetryRender();
     }
   }
 
+  // ---------------------------------------------------------------- 初始化
   function setupWavePanel() {
-    wave.canvas = document.getElementById('waveCanvas');
-    if (!wave.canvas) return;
-    wave.ctx = wave.canvas.getContext('2d');
-    els.waveInfo = document.getElementById('wave-info');
-    els.waveLegend = document.getElementById('wave-legend');
-    const winSel = document.getElementById('wave-window');
-    const btnPause = document.getElementById('btn-wave-pause');
+    wave.settings = loadWaveSettings();
+    const $ = id => document.getElementById(id);
+    els.waveInfo = $('wave-info');
+    els.waveLegend = $('wave-legend');
+    wave.stage = $('waveStage');
+    const mkLayer = id => { const c = $(id); return c && c.getContext ? { canvas: c, ctx: c.getContext('2d') } : null; };
+    const grid = mkLayer('waveGrid'), trace = mkLayer('waveCanvas'), overlay = mkLayer('waveOverlay');
+    wave.layers = (grid && trace && overlay) ? { grid, trace, overlay } : null;
+    wave.overview = mkLayer('waveOverview');
+    wave.settingsEl = $('wave-settings');
+    wave.tipEl = $('wave-tip');
+    wave.readoutEl = $('wave-readout');
+    wave.liveBtn = $('btn-wave-live');
+    if (!wave.layers) return;
 
-    const resize = () => {
-      const rect = wave.canvas.parentElement.getBoundingClientRect();
-      wave.canvas.width = Math.max(200, rect.width - 24);
-      wave.canvas.height = 220;
-    };
-    window.addEventListener('resize', resize);
-    resize();
-
-    if (winSel) winSel.addEventListener('change', () => { wave.windowSec = Number(winSel.value) || 2; });
-    const scaleSel = document.getElementById('wave-scale');
-    if (scaleSel) {
-      wave.scaleMode = scaleSel.value === 'shared' ? 'shared' : 'per';
-      scaleSel.addEventListener('change', () => { wave.scaleMode = scaleSel.value === 'shared' ? 'shared' : 'per'; });
+    measureStage();
+    if (typeof ResizeObserver === 'function' && wave.stage) {
+      new ResizeObserver(() => { measureStage(); wave.dirty = true; }).observe(wave.stage);
     }
-    if (btnPause) btnPause.addEventListener('click', () => {
-      wave.paused = !wave.paused;
-      btnPause.textContent = wave.paused ? '继续' : '暂停';
-    });
-    const btnWaveAnalyze = document.getElementById('btn-wave-analyze');
+    if (window.addEventListener) window.addEventListener('resize', () => { measureStage(); wave.dirty = true; });
+
+    const winSel = $('wave-window');
+    wave.ui.winSel = winSel;
+    if (winSel) {
+      syncWindowSelect();
+      winSel.addEventListener('change', () => {
+        const v = Number(winSel.value);
+        if (v > 0) {
+          wave.settings.xMode = 'time';
+          wave.settings.windowSec = v;
+          saveWaveSettings();
+          syncWindowSelect();
+          if (wave.mode !== 'live') goLive();
+          markDirty();
+          if (wave.settingsOpen) buildWaveSettingsPanel();
+        }
+      });
+    }
+    const layoutSel = $('wave-layout');
+    wave.ui.layoutSel = layoutSel;
+    if (layoutSel) {
+      layoutSel.value = wave.settings.layout;
+      layoutSel.addEventListener('change', () => setWaveLayout(layoutSel.value));
+    }
+    const btnPause = $('btn-wave-pause');
+    wave.ui.btnPause = btnPause;
+    if (btnPause) btnPause.addEventListener('click', toggleWavePause);
+    if (wave.liveBtn) wave.liveBtn.addEventListener('click', goLive);
+    const btnClear = $('btn-wave-clear');
+    if (btnClear) btnClear.addEventListener('click', () => clearWave(false));
+    const btnSet = $('btn-wave-settings');
+    if (btnSet) btnSet.addEventListener('click', () => toggleWaveSettings());
+    const btnWide = $('btn-wave-wide');
+    wave.ui.btnWide = btnWide;
+    if (btnWide) btnWide.addEventListener('click', () => { wave.settings.wide = !wave.settings.wide; saveWaveSettings(); applyWaveWide(); });
+    const btnWaveAnalyze = $('btn-wave-analyze');
     if (btnWaveAnalyze) btnWaveAnalyze.addEventListener('click', () => {
-      if (!wave.nch || !wave.ch[0] || wave.ch[0].length < 4) {
-        logTerminal('system', '⚠️ Ch1 尚无足够波形数据可供分析');
+      if (!wave.store || wave.store.count < 4) {
+        waveLog('system', '⚠️ Ch1 尚无足够波形数据可供分析');
         return;
       }
       if (window.RTTCapturePanel && typeof window.RTTCapturePanel.importCh1Snapshot === 'function') {
         window.RTTCapturePanel.importCh1Snapshot();
       }
     });
-    const btnWaveCsv = document.getElementById('btn-wave-csv');
-    if (btnWaveCsv) btnWaveCsv.addEventListener('click', () => {
-      if (!wave.nch || !wave.ch[0] || !wave.ch[0].length) {
-        logTerminal('system', '⚠️ Ch1 尚无波形数据可导出');
-        return;
-      }
-      const fs = Math.round(wave.displayRate || wave.fps || 100);
-      const snap = {
-        cap_id: 0, sample_hz: fs, trigger_index: 0, fmt_name: 'f32',
-        names: wave.names.slice(0, wave.nch),
-        channels: wave.ch.slice(0, wave.nch).map(a => a.slice())
-      };
-      if (window.RTTAnalysis && typeof window.RTTAnalysis.toCSV === 'function') {
-        const csv = window.RTTAnalysis.toCSV(snap, snap.names);
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `ch1_wave_${Date.now()}.csv`;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-      }
-    });
+    const btnWaveCsv = $('btn-wave-csv');
+    if (btnWaveCsv) btnWaveCsv.addEventListener('click', () => exportWaveCsv(true));
+
+    bindWaveInteractions();
+    applyWaveWide();
+    updateWaveModeUi();
     requestAnimationFrame(drawWave);
   }
 
+  function measureStage() {
+    if (!wave.stage) return;
+    const r = wave.stage.getBoundingClientRect ? wave.stage.getBoundingClientRect() : null;
+    const w = r && r.width ? r.width : (wave.stage.parentElement && wave.stage.parentElement.getBoundingClientRect
+      ? wave.stage.parentElement.getBoundingClientRect().width - 24 : 600);
+    wave.stageW = Math.max(200, Math.floor(w || 600));
+  }
+
+  function syncWindowSelect() {
+    const sel = wave.ui.winSel;
+    if (!sel) return;
+    const s = wave.settings;
+    const v = s.xMode === 'time' ? s.windowSec : 0;
+    const known = WAVE_WINDOW_PRESETS.some(p => Math.abs(p - v) < 1e-9);
+    // 自定义值 (滚轮缩放 / 设置面板输入) 以临时选项显示
+    if (sel.querySelector) {
+      let opt = sel.querySelector('option[data-custom]');
+      if (!known) {
+        if (!opt && document.createElement) {
+          opt = document.createElement('option');
+          opt.setAttribute && opt.setAttribute('data-custom', '1');
+          if (sel.appendChild) sel.appendChild(opt);
+        }
+        if (opt) {
+          opt.value = String(v || 0);
+          opt.textContent = s.xMode === 'time' ? `${WC ? WC.fmtTime(v, v / 10).replace('s', ' s') : v + ' s'}` : `${s.points} 点`;
+        }
+      } else if (opt && opt.remove) {
+        opt.remove();
+      }
+    }
+    sel.value = String(known ? v : (v || 0));
+  }
+
+  function setWaveLayout(v) {
+    if (!['overlay', 'split', 'custom'].includes(v)) return;
+    wave.settings.layout = v;
+    if (v === 'custom' && wave.settings.groups.length < wave.nch) {
+      for (let c = wave.settings.groups.length; c < wave.nch; c++) wave.settings.groups[c] = 1;
+    }
+    saveWaveSettings();
+    if (wave.ui.layoutSel) wave.ui.layoutSel.value = v;
+    wave.yState = {};
+    markDirty();
+    if (wave.settingsOpen) buildWaveSettingsPanel();
+  }
+
+  function markDirty() { wave.dirty = true; wave.overlayDirty = true; }
+
+  // ---------------------------------------------------------------- 图例
   function rebuildWaveLegend() {
     if (!els.waveLegend) return;
     els.waveLegend.textContent = '';
@@ -1167,10 +1315,7 @@
       dot.className = 'wave-dot';
       dot.style.backgroundColor = WAVE_COLORS[i % WAVE_COLORS.length];
       dot.title = '显示/隐藏该通道';
-      dot.addEventListener('click', () => {
-        wave.visible[i] = !wave.visible[i];
-        item.classList.toggle('wave-hidden', !wave.visible[i]);
-      });
+      dot.addEventListener('click', () => setWaveVisible(i, !wave.visible[i]));
       const name = document.createElement('span');
       name.className = 'wave-name';
       name.textContent = wave.names[i];
@@ -1183,56 +1328,129 @@
       els.waveLegend.appendChild(item);
       wave.valEls.push(val);
       wave.nameEls.push(name);
+      wave.legendItems = wave.legendItems || [];
+      wave.legendItems[i] = item;
     }
     syncCh1Keys();   // 通道数变化: 重算看板键名映射, 删除多余通道的旧磁贴
+    rebuildWaveTip();
   }
 
+  function setWaveVisible(i, on) {
+    if (!(i >= 0 && i < wave.nch)) return;
+    wave.visible[i] = !!on;
+    const item = wave.legendItems && wave.legendItems[i];
+    if (item && item.classList) item.classList.toggle('wave-hidden', !wave.visible[i]);
+    rebuildWaveTip();
+    markDirty();
+    if (wave.settingsOpen) buildWaveSettingsPanel();
+  }
+
+  // ---------------------------------------------------------------- 数据接收
+  function resetWaveChannels(nch) {
+    wave.nch = nch;
+    wave.displayRate = 0;
+    wave.rateJumpCount = 0;
+    wave.playhead = 0;
+    wave.lastDrawTs = 0;
+    wave.markers = [];
+    wave.cursors = { a: null, b: null };
+    wave.yState = {};
+    wave.yView = {};
+    wave.undo = [];
+    wave.mode = 'live';
+    wave.view = null;
+    wave.lastView = null;
+    if (WC) {
+      wave.capInfo = WC.planCapacity(wave.settings ? wave.settings.historySec : 60, 0, nch, WAVE_MEM_LIMIT);
+      wave.store = new WC.WaveStore(nch, wave.capInfo.cap);
+      wave.axis = new WC.TimeAxis(0);
+    }
+    rebuildWaveLegend();
+    updateWaveModeUi();
+    markDirty();
+    if (wave.settingsOpen) buildWaveSettingsPanel();
+  }
+
+  /** 旧版 JSON 'wave' 消息 (未订阅二进制时, 或旧网关) */
   function handleWave(msg) {
     const nch = Number(msg.nch) | 0;
     if (!Array.isArray(msg.frames) || nch <= 0 || nch > 32) return;
-    if (nch !== wave.nch) {
-      wave.nch = nch;
-      wave.ch = Array.from({ length: nch }, () => []);
-      wave.playhead = 0;
-      wave.displayRate = 0;
-      wave.rateJumpCount = 0;
-      wave.lastDrawTs = 0;
-      rebuildWaveLegend();
+    const rows = msg.frames.filter(fr => Array.isArray(fr) && fr.length === nch);
+    if (!rows.length) return;
+    const flat = new Float32Array(rows.length * nch);
+    for (let k = 0; k < rows.length; k++) {
+      const fr = rows[k];
+      for (let c = 0; c < nch; c++) { const v = fr[c]; flat[k * nch + c] = typeof v === 'number' ? v : NaN; }
     }
-    for (const fr of msg.frames) {
-      if (!Array.isArray(fr) || fr.length !== nch) continue;
-      for (let i = 0; i < nch; i++) {
-        const v = fr[i];
-        wave.ch[i].push(typeof v === 'number' ? v : NaN);
-      }
-    }
-    if (wave.ch[0].length > WAVE_MAX_SAMPLES + 2000) {
-      const drop = wave.ch[0].length - WAVE_MAX_SAMPLES;
-      wave.ch.forEach(a => a.splice(0, drop));
-      wave.playhead = Math.max(0, wave.playhead - drop);
-    }
-    wave.fps = Number(msg.fps) || wave.fps;
-    wave.decim = Number(msg.decim) || 1;
-    wave.resync = Number(msg.resync) || 0;
-    wave.lastRx = performance.now();
-    updateDisplayRate(wave.fps > 0 ? wave.fps / wave.decim : 0);
-    pushCh1ToDashboard(msg.frames[msg.frames.length - 1]);
+    waveIngest(flat, rows.length, nch, Number(msg.fps) || 0, Number(msg.decim) || 1, Number(msg.resync) || 0,
+      msg.frames[msg.frames.length - 1]);
+  }
 
-    const now = performance.now();
+  /** v3.1 二进制波形帧 (ArrayBuffer) */
+  function handleWaveBinary(buf) {
+    if (!WC) return;
+    const m = WC.decodeWaveBinary(buf);
+    if (!m || !m.nframes) return;
+    const last = Array.from(m.data.subarray((m.nframes - 1) * m.nch, m.nframes * m.nch));
+    waveIngest(m.data, m.nframes, m.nch, m.fps, m.decim, m.resync, last);
+  }
+
+  function waveIngest(data, nframes, nch, fps, decim, resync, lastRow) {
+    if (!(nch >= 1 && nch <= 32) || !(nframes >= 1)) return;
+    if (!wave.settings) wave.settings = loadWaveSettings();
+    if (nch !== wave.nch || (WC && !wave.store)) resetWaveChannels(nch);
+    wave.fps = fps > 0 ? fps : wave.fps;
+    wave.decim = decim > 0 ? decim : 1;
+    if (resync < wave.resyncBase) wave.resyncBase = 0;   // 网关重连后计数归零
+    wave.resync = resync >= 0 ? resync : 0;
+    wave.lastRx = waveNow();
+    updateDisplayRate(wave.fps > 0 ? wave.fps / wave.decim : 0);
+    if (wave.store) {
+      wave.axis.setRate(wave.store.head, wave.displayRate);
+      wave.store.pushInterleaved(data, nframes, nch);
+      maybeResizeStore(false);
+      if (wave.mode === 'live') wave.dirty = true;   // 浏览模式下新数据只写入缓存, 画面保持不动
+    }
+    wave.last = Array.isArray(lastRow) ? lastRow : null;
+    pushCh1ToDashboard(lastRow);
+
+    const now = waveNow();
     if (now - wave.lastLegendUpdate > 100) {
       wave.lastLegendUpdate = now;
-      const last = msg.frames[msg.frames.length - 1];
-      if (Array.isArray(last)) {
+      if (Array.isArray(lastRow)) {
         wave.valEls.forEach((el, i) => {
-          const v = last[i];
+          const v = lastRow[i];
           el.textContent = (typeof v === 'number') ? Number(v.toPrecision(6)).toString() : 'NaN';
         });
       }
-      if (els.waveInfo) {
-        const dec = wave.decim > 1 ? ` · 抽取 1/${wave.decim}` : '';
-        els.waveInfo.textContent = `${wave.fps.toFixed(0)} 帧/s · ${nch} 通道${dec} · 重同步 ${wave.resync}`;
-      }
+      updateWaveInfo();
     }
+  }
+
+  function updateWaveInfo() {
+    if (!els.waveInfo) return;
+    const dec = wave.decim > 1 ? ` · 抽取 1/${wave.decim}` : '';
+    els.waveInfo.textContent = `${wave.fps.toFixed(0)} 帧/s · ${wave.nch} 通道${dec} · 重同步 ${wave.resync - wave.resyncBase}`;
+    els.waveInfo.title = `帧率 / 通道数 / 抽取倍数 / 重同步次数` +
+      (wave.sub ? `\n传输: ${wave.sub.mode === 'full' ? '二进制全速' : wave.sub.mode === 'decim' ? '二进制 + min/max 抽取' : 'JSON (旧版)'}${wave.sub.lan ? ' (局域网)' : ''}` : '\n传输: JSON');
+  }
+
+  /** 按 "历史时长 × 实测速率" 调整环形缓冲容量 (每秒最多检查一次; force 用于修改历史时长后立即生效) */
+  function maybeResizeStore(force) {
+    const st = wave.store;
+    if (!st) return;
+    const now = waveNow();
+    if (!force && now - wave.lastCapCheck < 1000) return;
+    wave.lastCapCheck = now;
+    const plan = WC.planCapacity(wave.settings.historySec, wave.displayRate, wave.nch, WAVE_MEM_LIMIT);
+    wave.capInfo = plan;
+    if (force ? plan.cap !== st.cap : (plan.cap > st.cap * 1.05 || plan.cap < st.cap * 0.6)) {
+      st.resize(plan.cap);
+      markDirty();
+    }
+    wave.axis.prune(st.oldest);
+    if (wave.markers.length && wave.markers[0].idx < st.oldest) wave.markers = wave.markers.filter(m => m.idx >= st.oldest);
+    ['a', 'b'].forEach(k => { if (wave.cursors[k] !== null && wave.cursors[k] < st.oldest) wave.cursors[k] = null; });
   }
 
   // 横轴采样率平滑 (FIX-024 重写)。
@@ -1258,130 +1476,1011 @@
     }
   }
 
-  // 平滑播放头: 无线 OpenOCD 约每 120ms 成批送达 ~30 个样本 (250 帧/s 时),
-  // 若每帧直接画到最新样本, 60Hz 下表现为"静止约 7 帧 -> 瞬移 30 点"。
+  // 平滑播放头 (绝对样本序号): 无线 OpenOCD 约每 30~120ms 成批送达一批样本,
+  // 若每帧直接画到最新样本, 60Hz 下表现为"静止若干帧 -> 瞬移"。
   // 播放头按采样率匀速推进, 并按积压量做 ±比例修正, 使滞后稳定在 WAVE_PLAY_LAG_S 附近。
-  function advancePlayhead(ts, bufLen, rate) {
+  function advancePlayhead(ts, head, rate, oldest) {
     if (typeof ts !== 'number' || wave.lastDrawTs <= 0 || !(wave.fps > 0)) {
-      wave.playhead = bufLen;
+      wave.playhead = head;
     } else {
       const dt = Math.min(0.1, Math.max(0, (ts - wave.lastDrawTs) / 1000));
-      const lagS = (bufLen - wave.playhead) / rate;
+      const lagS = (head - wave.playhead) / rate;
       if (lagS < 0 || lagS > WAVE_PLAY_RESET_S) {
-        wave.playhead = Math.max(2, bufLen - rate * WAVE_PLAY_LAG_S);
+        wave.playhead = Math.max((oldest || 0) + 2, head - rate * WAVE_PLAY_LAG_S);
       } else if (lagS > 0) {
         const speed = 1 + Math.max(-0.25, Math.min(0.5, (lagS - WAVE_PLAY_LAG_S) * 2.5));
-        wave.playhead = Math.min(bufLen, wave.playhead + rate * speed * dt);
+        wave.playhead = Math.min(head, wave.playhead + rate * speed * dt);
       }
     }
     if (typeof ts === 'number') wave.lastDrawTs = ts;
   }
 
+  // ---------------------------------------------------------------- 视图 (实时 / 浏览)
+  function waveRate() {
+    return (wave.axis && wave.axis.rate) || wave.displayRate || 50;
+  }
+
+  function computeLiveView(ts) {
+    const st = wave.store;
+    const head = st.head;
+    const rate = waveRate();
+    let right = head;
+    if (wave.settings.smooth) {
+      advancePlayhead(ts, head, rate, st.oldest);
+      right = Math.min(head, Math.max(st.oldest + 1, wave.playhead));
+    } else {
+      wave.playhead = head;
+      if (typeof ts === 'number') wave.lastDrawTs = ts;
+    }
+    let left = wave.settings.xMode === 'points'
+      ? right - wave.settings.points
+      : wave.axis.idxAt(wave.axis.timeOf(right) - wave.settings.windowSec);
+    if (!(right - left >= 2)) left = right - 2;
+    return { i0: left, i1: right };
+  }
+
+  function clampBrowseView(v) {
+    const st = wave.store;
+    if (!v || !st) return v;
+    const oldest = st.oldest, head = st.head;
+    const avail = Math.max(8, head - oldest);
+    let span = Math.max(8, Math.min(v.i1 - v.i0, avail));
+    let i0 = v.i0, i1 = v.i0 + span;
+    if (i1 > head) { i1 = head; i0 = head - span; }
+    if (i0 < oldest) { i0 = oldest; i1 = oldest + span; }
+    return { i0, i1 };
+  }
+
+  function enterBrowse(view) {
+    if (wave.mode !== 'browse') {
+      wave.mode = 'browse';
+      const v = view || wave.lastView;
+      wave.view = v ? { i0: v.i0, i1: v.i1 } : null;
+      updateWaveModeUi();
+    }
+  }
+
+  function goLive() {
+    wave.mode = 'live';
+    wave.view = null;
+    wave.undo = [];
+    wave.lastDrawTs = 0;
+    updateWaveModeUi();
+    markDirty();
+  }
+
+  function toggleWavePause() {
+    if (wave.mode === 'live') { enterBrowse(wave.lastView); markDirty(); } else goLive();
+  }
+
+  function pushWaveUndo(kind) {
+    const now = waveNow();
+    // 连续的同类细粒度操作 (滚轮 / 方向键) 400ms 内合并为一步; 不同手势 (拖拽/框选/概览条) 各自独立
+    if ((kind === 'wheel' || kind === 'key') && kind === wave.lastUndoKind && now - wave.lastUndoTs < 400) {
+      wave.lastUndoTs = now;
+      return;
+    }
+    wave.lastUndoTs = now;
+    wave.lastUndoKind = kind || '';
+    const v = wave.mode === 'browse' && wave.view ? wave.view : wave.lastView;
+    if (!v) return;
+    wave.undo.push({ i0: v.i0, i1: v.i1, live: wave.mode === 'live' });
+    if (wave.undo.length > 50) wave.undo.shift();
+  }
+
+  function undoWaveView() {
+    const u = wave.undo.pop();
+    if (!u) return false;
+    if (u.live) { goLive(); return true; }
+    wave.mode = 'browse';
+    wave.view = { i0: u.i0, i1: u.i1 };
+    updateWaveModeUi();
+    markDirty();
+    return true;
+  }
+
+  function updateWaveModeUi() {
+    const live = wave.mode === 'live';
+    const b = wave.ui.btnPause;
+    if (b) {
+      b.textContent = live ? '⏸ 暂停' : '▶ 实时';
+      b.title = live ? '停止跟随 (后台继续接收), 进入历史浏览; 快捷键 空格' : '回到实时跟随; 快捷键 End / 空格';
+      if (b.classList) b.classList.toggle('btn-highlight', !live);
+    }
+    if (wave.liveBtn && wave.liveBtn.classList) wave.liveBtn.classList.toggle('hidden', live);
+    if (wave.stage && wave.stage.classList) wave.stage.classList.toggle('wave-browsing', !live);
+  }
+
+  // ---------------------------------------------------------------- 布局与纵轴
+  function channelGroup(c) {
+    const s = wave.settings;
+    if (s.layout === 'overlay') return 1;
+    if (s.layout === 'split') return c + 1;
+    return s.groups[c] || 1;
+  }
+
+  function buildWaveGroups() {
+    const map = new Map();
+    for (let c = 0; c < wave.nch; c++) {
+      if (!wave.visible[c]) continue;
+      const g = channelGroup(c);
+      if (!map.has(g)) map.set(g, []);
+      map.get(g).push(c);
+    }
+    return [...map.keys()].sort((a, b) => a - b).map(id => ({ id, chans: map.get(id) }));
+  }
+
+  function yCfgOf(gid) {
+    const c = wave.settings.yCfg[gid] || {};
+    return {
+      mode: ['per', 'auto', 'manual', 'sym'].includes(c.mode) ? c.mode : 'per',
+      min: Number(c.min) || 0, max: Number(c.max) || 0, sym: Math.abs(Number(c.sym) || 0)
+    };
+  }
+
+  function yViewOf(gid) {
+    if (!wave.yView[gid]) wave.yView[gid] = { zoom: 1, pan: 0 };
+    return wave.yView[gid];
+  }
+
+  function stableRange(key, lo, hi) {
+    const r = WC.stabilizeRange(wave.yState[key], lo, hi);
+    if (r) wave.yState[key] = r;
+    return r;
+  }
+
+  function computeWaveRanges(plots, view) {
+    const st = wave.store;
+    const mm = [NaN, NaN];
+    for (const p of plots) {
+      const cfg = yCfgOf(p.id);
+      const yv = yViewOf(p.id);
+      p.ranges = {};
+      p.axis = null;
+      if (cfg.mode === 'manual' && cfg.max > cfg.min) {
+        const r = WC.applyYView([cfg.min, cfg.max, WC.niceStep(cfg.max - cfg.min, 4)], yv.zoom, yv.pan);
+        p.axis = r;
+        p.chans.forEach(c => { p.ranges[c] = r; });
+        continue;
+      }
+      let lo = Infinity, hi = -Infinity;
+      const per = {};
+      for (const c of p.chans) {
+        st.rangeMinMax(c, view.i0, view.i1, mm);
+        per[c] = [mm[0], mm[1]];
+        if (mm[0] < lo) lo = mm[0];
+        if (mm[1] > hi) hi = mm[1];
+      }
+      if (cfg.mode === 'sym') {
+        let base;
+        if (cfg.sym > 0) base = [-cfg.sym, cfg.sym, WC.niceStep(2 * cfg.sym, 4)];
+        else {
+          const m = Math.max(Math.abs(lo), Math.abs(hi));
+          const r = stableRange(`${p.id}:sym`, -m, m);
+          if (r) { const a = Math.max(Math.abs(r[0]), Math.abs(r[1])); base = [-a, a, r[2]]; }
+        }
+        if (!base) continue;
+        const r = WC.applyYView(base, yv.zoom, yv.pan);
+        p.axis = r;
+        p.chans.forEach(c => { p.ranges[c] = r; });
+      } else if (cfg.mode === 'auto' || p.chans.length === 1) {
+        const base = stableRange(`${p.id}:*`, lo, hi);
+        if (!base) continue;
+        const r = WC.applyYView(base, yv.zoom, yv.pan);
+        p.axis = r;
+        p.chans.forEach(c => { p.ranges[c] = r; });
+      } else {
+        // 分通道铺满: 量纲差别大时 (如 ±1 的正弦与 1500 的转速) 小幅值通道不会被压成直线
+        for (const c of p.chans) {
+          const base = stableRange(`${p.id}:${c}`, per[c][0], per[c][1]);
+          if (base) p.ranges[c] = WC.applyYView(base, yv.zoom, yv.pan);
+        }
+      }
+    }
+  }
+
+  function desiredStageHeight(nGroups) {
+    if (wave.settings.height > 0) return wave.settings.height;
+    if (nGroups <= 1) return 240;
+    return Math.min(760, Math.max(240, nGroups * 118 + 24));
+  }
+
+  function ensureCanvasSize(nGroups) {
+    const L = wave.layers;
+    const cssW = wave.stageW || 600;
+    const cssH = desiredStageHeight(nGroups);
+    const dpr = Math.max(1, Math.min(3, (typeof window !== 'undefined' && window.devicePixelRatio) || 1));
+    if (cssW === wave.cssW && cssH === wave.cssH && dpr === wave.dpr) return false;
+    wave.cssW = cssW; wave.cssH = cssH; wave.dpr = dpr;
+    if (wave.stage && wave.stage.style) wave.stage.style.height = `${cssH}px`;
+    const fit = (layer, h) => {
+      if (!layer) return;
+      layer.canvas.width = Math.round(cssW * dpr);
+      layer.canvas.height = Math.round(h * dpr);
+      if (layer.canvas.style) { layer.canvas.style.width = `${cssW}px`; layer.canvas.style.height = `${h}px`; }
+      if (layer.ctx.setTransform) layer.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    fit(L.grid, cssH); fit(L.trace, cssH); fit(L.overlay, cssH);
+    fit(wave.overview, WAVE_OVERVIEW_H);
+    wave.gridSig = '';
+    wave.ovLast = 0;
+    wave.dirty = true;
+    return true;
+  }
+
+  // ---------------------------------------------------------------- 渲染循环
   function drawWave(ts) {
     requestAnimationFrame(drawWave);
-    if (wave.paused || !wave.ctx) return;
-    const c = wave.ctx;
-    const w = wave.canvas.width;
-    const h = wave.canvas.height;
-    c.clearRect(0, 0, w, h);
-    c.strokeStyle = '#1e2430';
-    c.lineWidth = 1;
-    for (let y = 20; y < h; y += 40) { c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke(); }
-    if (wave.nch === 0 || wave.ch[0].length < 2) return;
+    if (!wave.layers) return;
+    if (typeof ts === 'number' && wave.lastFrameTs && ts - wave.lastFrameTs < 1000 / wave.settings.fpsCap - 2) return;
+    if (typeof ts === 'number') wave.lastFrameTs = ts;
+    renderWaveFrame(ts);
+  }
 
-    const bufLen = wave.ch[0].length;
-    const rate = wave.displayRate > 0 ? wave.displayRate : 50;
-    advancePlayhead(ts, bufLen, rate);
-
-    const total = Math.min(bufLen, Math.max(2, Math.round(wave.playhead)));
-    const n = Math.max(2, Math.min(total, Math.round(wave.windowSec * rate)));
-    const start = total - n;
-
-    // 纵轴范围: 共用纵轴 = 所有可见通道合并求 min/max;
-    // 分通道缩放 = 每个通道按自身 min/max 铺满高度 (量纲差别大时, 如 ±1 的 sin 与 1500 的转速, 小幅值通道不再被压成直线)
-    const chRange = (i) => {
-      let lo = Infinity, hi = -Infinity;
-      const a = wave.ch[i];
-      for (let k = start; k < total; k++) {
-        const v = a[k];
-        if (Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  function renderWaveFrame(ts) {
+    if (!wave.layers || !WC) return;
+    const t0 = waveNow();
+    const st = wave.store;
+    const groups = st ? buildWaveGroups() : [];
+    ensureCanvasSize(groups.length);
+    const w = wave.cssW, h = wave.cssH;
+    if (!st || st.count < 1) {
+      if (wave.dirty) {
+        WC.drawGrid(wave.layers.grid.ctx, { w, h, plots: WC.computeLayout(w, h, [{ id: 0, chans: [] }]), xTicks: [] });
+        wave.layers.trace.ctx.clearRect(0, 0, w, h);
+        wave.layers.overlay.ctx.clearRect(0, 0, w, h);
+        if (wave.overview) wave.overview.ctx.clearRect(0, 0, w, WAVE_OVERVIEW_H);
+        wave.gridSig = '';
+        wave.dirty = false;
       }
-      return [lo, hi];
-    };
-    const padRange = (lo, hi) => {
-      const pad = Math.max((hi - lo) * 0.08, Math.abs(hi) * 0.02, 1e-6);
-      return [lo - pad, hi + pad];
-    };
-    const ranges = [];
-    let gLo = Infinity, gHi = -Infinity;
-    for (let i = 0; i < wave.nch; i++) {
-      if (!wave.visible[i]) continue;
-      const [lo, hi] = chRange(i);
-      ranges[i] = [lo, hi];
-      if (lo < gLo) gLo = lo;
-      if (hi > gHi) gHi = hi;
+      updateWaveReadout(t0, true);
+      return;
     }
-    if (!Number.isFinite(gLo)) return;
-    const shared = wave.scaleMode === 'shared';
-    const [sLo, sHi] = padRange(gLo, gHi);
-    for (let i = 0; i < wave.nch; i++) {
-      if (!ranges[i]) continue;
-      ranges[i] = shared ? [sLo, sHi]
-        : (Number.isFinite(ranges[i][0]) ? padRange(ranges[i][0], ranges[i][1]) : [sLo, sHi]);
+    const plots = WC.computeLayout(w, h, groups);
+    let view;
+    if (wave.mode === 'live') view = computeLiveView(ts);
+    else {
+      wave.view = clampBrowseView(wave.view || wave.lastView || computeLiveView(ts));
+      view = wave.view;
     }
-    const yIn = (v, r) => h - 8 - ((v - r[0]) / (r[1] - r[0])) * (h - 16);
+    const lv = wave.lastView;
+    const vchg = !lv || Math.abs(view.i0 - lv.i0) > 1e-6 || Math.abs(view.i1 - lv.i1) > 1e-6;
+    const layoutSig = `${w}x${h}|` + plots.map(p => `${p.id}:${p.chans.join('.')}`).join('|');
+    const lchg = layoutSig !== wave.layoutSig;
 
-    if (shared && sLo < 0 && sHi > 0) {   // 零线 (仅共用纵轴时有意义)
-      c.strokeStyle = '#30363d';
-      c.setLineDash([3, 3]);
-      c.beginPath(); c.moveTo(0, yIn(0, [sLo, sHi])); c.lineTo(w, yIn(0, [sLo, sHi])); c.stroke();
-      c.setLineDash([]);
-    }
-
-    const perPx = n / w;
-    for (let i = 0; i < wave.nch; i++) {
-      if (!wave.visible[i]) continue;
-      const a = wave.ch[i];
-      const r = ranges[i];
-      const yOf = v => yIn(v, r);
-      c.strokeStyle = WAVE_COLORS[i % WAVE_COLORS.length];
-      c.lineWidth = 1.5;
-      c.beginPath();
-      let pen = false;
-      if (perPx <= 1.5) {
-        for (let k = 0; k < n; k++) {
-          const v = a[start + k];
-          if (!Number.isFinite(v)) { pen = false; continue; }
-          const x = (k / (n - 1)) * w;
-          if (pen) c.lineTo(x, yOf(v)); else { c.moveTo(x, yOf(v)); pen = true; }
-        }
-      } else {
-        // 样本多于像素: 每列画 min-max 竖线, 保留尖峰 (简单抽点会漏掉)
-        for (let px = 0; px < w; px++) {
-          const k0 = start + Math.floor(px * perPx);
-          const k1 = Math.min(total, start + Math.floor((px + 1) * perPx));
-          let mn = Infinity, mx = -Infinity;
-          for (let k = k0; k < k1; k++) {
-            const v = a[k];
-            if (Number.isFinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; }
-          }
-          if (!Number.isFinite(mn)) { pen = false; continue; }
-          if (pen) c.lineTo(px, yOf(mn)); else { c.moveTo(px, yOf(mn)); pen = true; }
-          c.lineTo(px, yOf(mx));
-        }
+    if (vchg || lchg || wave.dirty) {
+      wave.lastView = { i0: view.i0, i1: view.i1 };
+      wave.layoutSig = layoutSig;
+      wave.dirty = false;
+      wave.plots = plots;
+      computeWaveRanges(plots, view);
+      const x0 = plots.length ? plots[0].x0 : 0, x1 = plots.length ? plots[0].x1 : w;
+      const tt = WC.timeTicks(wave.axis, view.i0, view.i1, x0, x1, wave.mode === 'live');
+      wave.tickStep = tt.step;
+      // 网格层: 只有布局、纵轴刻度或时间刻度变化时才重绘 (实时模式下窗口不变则刻度位置固定)
+      const gsig = layoutSig + '|' + plots.map(p => (p.axis ? `${p.axis[0].toPrecision(6)},${p.axis[1].toPrecision(6)}` : 'per')).join('|')
+        + '|' + tt.ticks.map(t => `${Math.round(t.x)}${t.text}`).join(',');
+      if (gsig !== wave.gridSig) {
+        WC.drawGrid(wave.layers.grid.ctx, { w, h, plots, xTicks: tt.ticks });
+        wave.gridSig = gsig;
+        wave.perf.gridDraws++;
       }
-      c.stroke();
+      const frame = {
+        w, h, plots, store: st, view, colors: WAVE_COLORS, colBuf: wave.colBuf, lineWidth: 1.5,
+        markers: wave.settings.markers ? wave.markers : null, cursors: wave.cursors
+      };
+      wave.perf.vertices = WC.drawTraces(wave.layers.trace.ctx, frame);
+      wave.colBuf = frame.colBuf;
+      wave.overlayDirty = true;
+      wave.perf.frames++;
+      if (wave.mode === 'browse') wave.ovLast = 0;   // 浏览时视窗框随交互立即更新
     }
+    if (wave.overlayDirty) {
+      wave.overlayDirty = false;
+      drawWaveOverlay();
+    }
+    if (wave.overview && waveNow() - wave.ovLast > 250) {
+      wave.ovLast = waveNow();
+      const p0 = wave.plots[0];
+      wave.ovInfo = WC.drawOverview(wave.overview.ctx, {
+        w, h: WAVE_OVERVIEW_H, store: st, chans: wave.visible.map((v, c) => (v ? c : -1)).filter(c => c >= 0),
+        colors: WAVE_COLORS, view: wave.lastView, x0: p0 ? p0.x0 : 0, x1: p0 ? p0.x1 : w, colBuf: wave.ovColBuf
+      });
+    }
+    const ms = waveNow() - t0;
+    const ph = wave.perf.hist;
+    ph.push(ms);
+    if (ph.length > 120) ph.shift();
+    updateWaveReadout(t0, false);
+  }
 
-    c.fillStyle = '#8b949e';
-    c.font = '11px monospace';
-    if (shared) {
-      c.fillText(Number(sHi.toPrecision(5)).toString(), 4, 12);
-      c.fillText(Number(sLo.toPrecision(5)).toString(), 4, h - 4);
+  function waveIdxAtX(x) {
+    const p = wave.plots[0], v = wave.lastView;
+    if (!p || !v) return NaN;
+    return v.i0 + (x - p.x0) / (p.x1 - p.x0) * (v.i1 - v.i0);
+  }
+
+  function waveXAtIdx(i) {
+    const p = wave.plots[0], v = wave.lastView;
+    if (!p || !v) return NaN;
+    return p.x0 + (i - v.i0) / (v.i1 - v.i0) * (p.x1 - p.x0);
+  }
+
+  /** 十字光标处每个可见通道的取值 (绝对序号就近取样) */
+  function waveHoverSample() {
+    const hv = wave.hover, st = wave.store;
+    if (!hv || !st || !wave.plots.length) return null;
+    const p0 = wave.plots[0];
+    if (hv.x < p0.x0 || hv.x > p0.x1) return null;
+    const idx = Math.round(waveIdxAtX(hv.x));
+    if (!(idx >= st.oldest && idx < st.head)) return null;
+    const points = [];
+    const values = [];
+    for (const p of wave.plots) {
+      for (const c of p.chans) {
+        const v = st.get(c, idx);
+        values[c] = v;
+        const r = p.ranges && p.ranges[c];
+        const y = r && r[1] > r[0] ? p.y1 - (v - r[0]) / (r[1] - r[0]) * (p.y1 - p.y0) : NaN;
+        points.push({ y: y >= p.y0 - 2 && y <= p.y1 + 2 ? y : NaN, color: WAVE_COLORS[c % WAVE_COLORS.length] });
+      }
+    }
+    return { idx, sx: waveXAtIdx(idx), values, points, t: wave.axis.timeOf(idx) };
+  }
+
+  function drawWaveOverlay() {
+    const L = wave.layers;
+    const frame = { w: wave.cssW, h: wave.cssH, plots: wave.plots };
+    const hs = wave.drag && wave.drag.moved && wave.drag.kind === 'pan' ? null : waveHoverSample();
+    WC.drawOverlay(L.overlay.ctx, frame, hs ? { x: wave.hover.x, y: wave.hover.y, sx: hs.sx, points: hs.points } : null, wave.select);
+    updateWaveTip(hs);
+  }
+
+  // ---------------------------------------------------------------- 十字光标读数框
+  function rebuildWaveTip() {
+    const tip = wave.tipEl;
+    if (!tip || !document.createElement) return;
+    tip.textContent = '';
+    const head = document.createElement('div');
+    head.className = 'wave-tip-time';
+    tip.appendChild(head);
+    wave.tipTime = head;
+    wave.tipRows = [];
+    for (let c = 0; c < wave.nch; c++) {
+      const row = document.createElement('div');
+      row.className = 'wave-tip-row' + (wave.visible[c] ? '' : ' hidden');
+      const dot = document.createElement('span');
+      dot.className = 'wave-dot';
+      dot.style.backgroundColor = WAVE_COLORS[c % WAVE_COLORS.length];
+      const name = document.createElement('span');
+      name.className = 'wave-tip-name';
+      name.textContent = wave.names[c] || `CH${c}`;
+      const val = document.createElement('span');
+      val.className = 'wave-tip-val';
+      row.append(dot, name, val);
+      tip.appendChild(row);
+      wave.tipRows[c] = val;
+    }
+  }
+
+  function updateWaveTip(hs) {
+    const tip = wave.tipEl;
+    if (!tip || !tip.style) return;
+    if (!hs || !wave.hover) { tip.style.display = 'none'; return; }
+    tip.style.display = 'block';
+    if (wave.tipTime) wave.tipTime.textContent = `t = ${WC.fmtTime(hs.t, Math.max(1e-6, wave.tickStep / 100))}  #${hs.idx}`;
+    for (let c = 0; c < wave.nch; c++) {
+      const el = wave.tipRows && wave.tipRows[c];
+      if (!el) continue;
+      const v = hs.values[c];
+      el.textContent = v === undefined ? '' : (Number.isFinite(v) ? Number(v.toPrecision(6)).toString() : 'NaN');
+    }
+    const tw = tip.offsetWidth || 140;
+    const left = wave.hover.x + 14 + tw > wave.cssW ? wave.hover.x - 14 - tw : wave.hover.x + 14;
+    tip.style.left = `${Math.max(0, left)}px`;
+    tip.style.top = `${Math.max(0, Math.min(wave.cssH - 40, wave.hover.y - 10))}px`;
+  }
+
+  // ---------------------------------------------------------------- 光标 / 标注 / 读数条
+  function setWaveCursor(k, idx) {
+    const st = wave.store;
+    if (!st || !Number.isFinite(idx) || st.count < 1) return;
+    wave.cursors[k] = Math.max(st.oldest, Math.min(st.head - 1, Math.round(idx)));
+    wave.lastReadout = 0;
+    markDirty();
+  }
+
+  function clearWaveCursors() {
+    wave.cursors = { a: null, b: null };
+    wave.lastReadout = 0;
+    markDirty();
+  }
+
+  /** ACK 回调: 参数值变化时在时间轴上打标注 (首次出现只记录基准, 不打标注) */
+  function waveOnAck(msg) {
+    if (!msg || !msg.success || msg.param === undefined) return;
+    const p = String(msg.param), v = String(msg.val);
+    const prev = wave.ackVals[p];
+    wave.ackVals[p] = v;
+    if (prev === undefined || prev === v || !wave.store || wave.store.count < 1) return;
+    wave.markers.push({ idx: wave.store.head - 1, text: `${p}: ${prev}→${v}` });
+    if (wave.markers.length > WAVE_MAX_MARKERS) wave.markers.shift();
+    markDirty();
+  }
+
+  function waveOnConnected() {
+    if (wave.settings && wave.settings.clearOnConnect && wave.store && wave.store.count) clearWave(true);
+  }
+
+  function updateWaveReadout(t0, empty) {
+    const el = wave.readoutEl;
+    if (!el) return;
+    const now = waveNow();
+    if (now - wave.lastReadout < 150) return;
+    wave.lastReadout = now;
+    const ph = wave.perf.hist;
+    if (ph.length) {
+      const sorted = ph.slice().sort((a, b) => a - b);
+      wave.perf.ms = ph[ph.length - 1];
+      wave.perf.p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+    }
+    if (!wave.ui.roMode && document.createElement) {
+      el.textContent = '';
+      wave.ui.roMode = document.createElement('span'); wave.ui.roMode.className = 'wave-ro-mode';
+      wave.ui.roCur = document.createElement('span'); wave.ui.roCur.className = 'wave-ro-cursor';
+      wave.ui.roPerf = document.createElement('span'); wave.ui.roPerf.className = 'wave-ro-perf';
+      el.append(wave.ui.roMode, wave.ui.roCur, wave.ui.roPerf);
+    }
+    const ui = wave.ui;
+    if (!ui.roMode) return;
+    const st = wave.store, v = wave.lastView;
+    if (empty || !st || !v) {
+      ui.roMode.textContent = '等待 Ch1 数据…  左键拖拽平移 · 滚轮缩放 · 单击/右键放置光标 A/B · Shift+滚轮缩放纵轴 · Ctrl+拖拽框选放大';
+      ui.roCur.textContent = '';
+      ui.roPerf.textContent = '';
+      return;
+    }
+    const tStep = Math.max(1e-6, wave.tickStep / 10);
+    const n = Math.round(v.i1 - v.i0);
+    if (wave.mode === 'live') {
+      const win = wave.settings.xMode === 'points' ? `${wave.settings.points} 点` : `${WC.fmtTime(wave.settings.windowSec, wave.settings.windowSec / 10)}`;
+      ui.roMode.textContent = `● 实时 · 窗口 ${win} (${n} 点) · 历史 ${WC.fmtTime(wave.axis.timeOf(st.head) - wave.axis.timeOf(st.oldest), 0.1)}`;
     } else {
-      c.fillText('分通道缩放 (数值见图例)', 4, 12);
+      const lag = wave.axis.timeOf(st.head) - wave.axis.timeOf(v.i1);
+      ui.roMode.textContent = `⏸ 浏览 · ${WC.fmtTime(wave.axis.timeOf(v.i0), tStep)} – ${WC.fmtTime(wave.axis.timeOf(v.i1), tStep)} (${n} 点) · 距最新 ${WC.fmtTime(lag, 0.1)}`;
     }
-    c.fillText(`${wave.windowSec}s / ${n} 点`, w - 90, 12);
+    const { a, b } = wave.cursors;
+    let cur = '';
+    if (a !== null) cur += `A ${WC.fmtTime(wave.axis.timeOf(a), tStep)}`;
+    if (b !== null) cur += `${cur ? ' · ' : ''}B ${WC.fmtTime(wave.axis.timeOf(b), tStep)}`;
+    if (a !== null && b !== null) {
+      const dt = Math.abs(wave.axis.timeOf(b) - wave.axis.timeOf(a));
+      cur += ` · Δt ${dt < 1 ? (dt * 1000).toPrecision(4) + ' ms' : dt.toPrecision(5) + ' s'}`;
+      if (dt > 0) cur += ` · 1/Δt ${(1 / dt).toPrecision(5)} Hz`;
+      const ds = [];
+      for (let c = 0; c < wave.nch; c++) {
+        if (!wave.visible[c]) continue;
+        const d = st.valueAt(c, b) - st.valueAt(c, a);
+        ds.push(`Δ${wave.names[c] || 'CH' + c} ${Number.isFinite(d) ? Number(d.toPrecision(5)) : 'NaN'}`);
+      }
+      if (ds.length) cur += ' · ' + ds.join(' · ');
+    }
+    ui.roCur.textContent = cur;
+    ui.roPerf.textContent = `渲染 ${wave.perf.ms.toFixed(1)} ms · p95 ${wave.perf.p95.toFixed(1)} ms`;
+    if (wave.settingsOpen && now - wave.lastSettingsRefresh > 500) {
+      wave.lastSettingsRefresh = now;
+      refreshWaveSettingsLive();
+    }
+  }
+
+  // ---------------------------------------------------------------- 清空
+  function clearWave(silent) {
+    const st = wave.store;
+    if (st) {
+      st.clear();
+      wave.axis.reset(st.head);
+      wave.axis.setRate(st.head, wave.displayRate);
+      wave.playhead = st.head;
+    }
+    wave.markers = [];
+    wave.cursors = { a: null, b: null };
+    wave.yState = {};
+    wave.lastDrawTs = 0;
+    wave.resyncBase = wave.resync;
+    wave.lastView = null;
+    wave.gridSig = '';
+    wave.ovLast = 0;
+    goLive();
+    updateWaveInfo();
+    if (!silent) waveLog('system', '🗑 Ch1 波形缓存、光标与标注已清空');
+  }
+
+  function clearAllData() {
+    clearWave(true);
+    if (els.termOutput) els.termOutput.innerHTML = '';
+    if (typeof resetTelemetryDashboard === 'function') resetTelemetryDashboard();
+    if (window.RTTCapturePanel && typeof window.RTTCapturePanel.clearHistory === 'function') window.RTTCapturePanel.clearHistory();
+    waveLog('system', '🗑 已清空: Ch1 波形 / 终端 / 遥测看板 / Ch2 采集记录');
+  }
+
+  // ---------------------------------------------------------------- 导出与送入分析
+  /** kind='export': A-B 区间, 否则全部历史; kind='analysis': A-B 区间, 否则当前视图 */
+  function waveRange(kind) {
+    const st = wave.store;
+    if (!st || st.count < 2) return null;
+    const { a, b } = wave.cursors;
+    if (a !== null && b !== null && Math.abs(b - a) >= 2) {
+      return { i0: Math.max(st.oldest, Math.min(a, b)), i1: Math.min(st.head, Math.max(a, b) + 1), src: 'A–B 光标区间' };
+    }
+    if (kind === 'analysis' && wave.lastView) {
+      return { i0: Math.max(st.oldest, Math.floor(wave.lastView.i0)), i1: Math.min(st.head, Math.ceil(wave.lastView.i1)), src: '当前视图' };
+    }
+    return { i0: st.oldest, i1: st.head, src: '全部历史' };
+  }
+
+  function exportWaveCsv(download) {
+    const r = waveRange('export');
+    if (!r || r.i1 - r.i0 < 1) {
+      waveLog('system', '⚠️ Ch1 尚无波形数据可导出');
+      return null;
+    }
+    const st = wave.store, nch = wave.nch;
+    const cols = [];
+    for (let c = 0; c < nch; c++) cols.push(st.slice(c, r.i0, r.i1));
+    const n = cols[0].length;
+    const names = wave.names.slice(0, nch).map(s => '"' + String(s).replace(/"/g, '""') + '"');
+    const parts = [`index,t_s,${names.join(',')}\n`];
+    const tBase = wave.axis.timeOf(r.i0);
+    let chunk = [];
+    for (let k = 0; k < n; k++) {
+      let line = `${k},${(wave.axis.timeOf(r.i0 + k) - tBase).toPrecision(9)}`;
+      for (let c = 0; c < nch; c++) { const v = cols[c][k]; line += ',' + (Number.isFinite(v) ? Number(v.toPrecision(7)) : ''); }
+      chunk.push(line);
+      if (chunk.length >= 20000) { parts.push(chunk.join('\n') + '\n'); chunk = []; }
+    }
+    if (chunk.length) parts.push(chunk.join('\n') + '\n');
+    if (download && typeof Blob !== 'undefined' && document.createElement) {
+      const blob = new Blob(parts, { type: 'text/csv;charset=utf-8' });
+      const el = document.createElement('a');
+      el.href = URL.createObjectURL(blob);
+      el.download = `ch1_wave_${Date.now()}.csv`;
+      el.click();
+      setTimeout(() => URL.revokeObjectURL(el.href), 2000);
+      waveLog('system', `📄 已导出 Ch1 波形 CSV: ${r.src}, ${n} 点 × ${nch} 通道`);
+    }
+    return { rows: n, src: r.src, csv: parts.join('') };
+  }
+
+  function getCh1Snapshot(kind) {
+    const r = waveRange(kind || 'analysis');
+    const st = wave.store;
+    if (!r || !st) return { sample_hz: Math.max(1, Math.round(wave.displayRate || wave.fps || 100)), nch: wave.nch, names: wave.names.slice(0, wave.nch), channels: [] };
+    let i0 = r.i0;
+    if (r.i1 - i0 > WAVE_ANALYSIS_MAX) {
+      i0 = r.i1 - WAVE_ANALYSIS_MAX;
+      waveLog('system', `⚠️ ${r.src} 共 ${r.i1 - r.i0} 点, 超过分析上限, 仅取最新 ${WAVE_ANALYSIS_MAX} 点`);
+    }
+    const channels = [];
+    for (let c = 0; c < wave.nch; c++) channels.push(Array.from(st.slice(c, i0, r.i1)));
+    return {
+      sample_hz: Math.max(1, Math.round(wave.axis.rateAt(r.i1 - 1) || wave.displayRate || wave.fps || 100)),
+      nch: wave.nch, names: wave.names.slice(0, wave.nch), channels, range: r.src, i0, i1: r.i1
+    };
+  }
+
+  // ---------------------------------------------------------------- 交互
+  function bindWaveInteractions() {
+    const ov = wave.layers.overlay.canvas;
+    const posOf = e => {
+      const r = ov.getBoundingClientRect ? ov.getBoundingClientRect() : { left: 0, top: 0 };
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    };
+    ov.addEventListener('pointerdown', e => {
+      if (!wave.store || !wave.plots.length || e.button !== 0) return;
+      const pos = posOf(e);
+      if (ov.setPointerCapture && e.pointerId !== undefined) { try { ov.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ } }
+      const pi = WC.plotAt(wave.plots, pos.y);
+      const gid = pi >= 0 ? wave.plots[pi].id : 0;
+      wave.drag = {
+        x0: pos.x, y0: pos.y, moved: false, plot: pi,
+        kind: (e.ctrlKey || e.metaKey) ? 'box' : (e.shiftKey ? 'ypan' : 'pan'),
+        view0: wave.lastView ? { i0: wave.lastView.i0, i1: wave.lastView.i1 } : null,
+        yv0: Object.assign({}, yViewOf(gid))
+      };
+    });
+    ov.addEventListener('pointermove', e => {
+      const pos = posOf(e);
+      wave.hover = pos;
+      wave.overlayDirty = true;
+      const d = wave.drag;
+      if (!d || !d.view0) return;
+      if (!d.moved && Math.hypot(pos.x - d.x0, pos.y - d.y0) > 3) {
+        d.moved = true;
+        if (d.kind === 'pan') { pushWaveUndo('pan'); enterBrowse(d.view0); }
+      }
+      if (!d.moved) return;
+      const p0 = wave.plots[0];
+      if (d.kind === 'pan' && p0) {
+        const shift = -(pos.x - d.x0) * (d.view0.i1 - d.view0.i0) / (p0.x1 - p0.x0);
+        wave.view = { i0: d.view0.i0 + shift, i1: d.view0.i1 + shift };
+        wave.dirty = true;
+      } else if (d.kind === 'box') {
+        wave.select = { x0: d.x0, x1: pos.x };
+      } else if (d.kind === 'ypan' && d.plot >= 0) {
+        const p = wave.plots[d.plot];
+        const yv = yViewOf(p.id);
+        yv.pan = d.yv0.pan + (pos.y - d.y0) / (p.y1 - p.y0) / (yv.zoom || 1);
+        wave.dirty = true;
+      }
+    });
+    const endDrag = e => {
+      const d = wave.drag;
+      wave.drag = null;
+      if (!d) return;
+      if (!d.moved) {
+        setWaveCursor('a', waveIdxAtX(d.x0));
+      } else if (d.kind === 'box' && wave.select) {
+        const xa = Math.min(wave.select.x0, wave.select.x1), xb = Math.max(wave.select.x0, wave.select.x1);
+        wave.select = null;
+        if (xb - xa > 4) {
+          pushWaveUndo('box');
+          const ia = waveIdxAtX(xa), ib = waveIdxAtX(xb);
+          enterBrowse(wave.lastView);
+          wave.view = { i0: ia, i1: ib };
+        }
+      }
+      markDirty();
+    };
+    ov.addEventListener('pointerup', endDrag);
+    ov.addEventListener('pointercancel', () => { wave.drag = null; wave.select = null; markDirty(); });
+    ov.addEventListener('pointerleave', () => { if (!wave.drag) { wave.hover = null; wave.overlayDirty = true; } });
+    ov.addEventListener('contextmenu', e => {
+      if (e.preventDefault) e.preventDefault();
+      if (!wave.store || !wave.plots.length) return;
+      setWaveCursor('b', waveIdxAtX(posOf(e).x));
+    });
+    ov.addEventListener('wheel', e => {
+      if (!wave.store || !wave.plots.length) return;
+      if (e.preventDefault) e.preventDefault();
+      const pos = posOf(e);
+      const dy = e.deltaY || e.deltaX || 0;
+      if (!dy) return;
+      const factor = dy > 0 ? 1.25 : 0.8;
+      if (e.shiftKey) {
+        const pi = WC.plotAt(wave.plots, pos.y);
+        if (pi < 0) return;
+        const yv = yViewOf(wave.plots[pi].id);
+        yv.zoom = Math.max(0.05, Math.min(1e5, yv.zoom / factor));
+        wave.dirty = true;
+        return;
+      }
+      if (wave.mode === 'live') {
+        const s = wave.settings;
+        if (s.xMode === 'points') s.points = Math.round(Math.max(10, Math.min(wave.store.cap, s.points * factor)));
+        else s.windowSec = Math.max(0.01, Math.min(s.historySec, Number((s.windowSec * factor).toPrecision(3))));
+        saveWaveSettings();
+        syncWindowSelect();
+        wave.dirty = true;
+        return;
+      }
+      pushWaveUndo('wheel');
+      const c = waveIdxAtX(pos.x), v = wave.view || wave.lastView;
+      wave.view = { i0: c - (c - v.i0) * factor, i1: c + (v.i1 - c) * factor };
+      wave.dirty = true;
+    }, { passive: false });
+    ov.addEventListener('dblclick', e => {
+      if (!wave.plots.length) return;
+      const pi = WC.plotAt(wave.plots, posOf(e).y);
+      if (pi < 0) return;
+      const id = wave.plots[pi].id;
+      wave.yView[id] = { zoom: 1, pan: 0 };
+      Object.keys(wave.yState).forEach(k => { if (k.split(':')[0] === String(id)) delete wave.yState[k]; });
+      markDirty();
+    });
+    if (wave.stage) {
+      wave.stage.addEventListener('pointerenter', () => { wave.hoverStage = true; });
+      wave.stage.addEventListener('pointerleave', () => { wave.hoverStage = false; });
+    }
+    if (document.addEventListener) document.addEventListener('keydown', waveKeyHandler);
+
+    // 概览条: 拖动视窗框平移; 点击其他位置跳转到该处
+    const oc = wave.overview && wave.overview.canvas;
+    if (oc) {
+      const opos = e => { const r = oc.getBoundingClientRect ? oc.getBoundingClientRect() : { left: 0 }; return e.clientX - r.left; };
+      oc.addEventListener('pointerdown', e => {
+        const info = wave.ovInfo;
+        if (!info || !wave.lastView || e.button !== 0) return;
+        if (oc.setPointerCapture && e.pointerId !== undefined) { try { oc.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ } }
+        const x = opos(e);
+        const k = (info.b - info.a) / Math.max(1, info.x1 - info.x0);
+        const span = wave.lastView.i1 - wave.lastView.i0;
+        pushWaveUndo('overview');
+        enterBrowse(wave.lastView);
+        if (!(x >= info.xa && x <= info.xb)) {
+          const idx = info.a + (x - info.x0) * k;
+          wave.view = { i0: idx - span / 2, i1: idx + span / 2 };
+        }
+        // 先夹紧再记录拖动起点: 否则从越界的跳转位置开始拖动时, 前一段位移会被夹紧吃掉
+        wave.view = clampBrowseView(wave.view);
+        wave.ovDrag = { x0: x, view0: Object.assign({}, wave.view), k };
+        markDirty();
+      });
+      oc.addEventListener('pointermove', e => {
+        const d = wave.ovDrag;
+        if (!d) return;
+        const shift = (opos(e) - d.x0) * d.k;
+        wave.view = { i0: d.view0.i0 + shift, i1: d.view0.i1 + shift };
+        wave.dirty = true;
+      });
+      const end = () => { wave.ovDrag = null; };
+      oc.addEventListener('pointerup', end);
+      oc.addEventListener('pointercancel', end);
+    }
+  }
+
+  function waveKeyHandler(e) {
+    if (!wave.hoverStage && !(wave.stage && document.activeElement === wave.stage)) return;
+    const tag = (e.target && e.target.tagName) || '';
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return;
+    let handled = true;
+    if (e.key === ' ' || e.code === 'Space') toggleWavePause();
+    else if (e.key === 'End') goLive();
+    else if (e.key === 'Escape') clearWaveCursors();
+    else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) undoWaveView();
+    else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && wave.lastView) {
+      const v = wave.mode === 'browse' && wave.view ? wave.view : wave.lastView;
+      const d = (v.i1 - v.i0) * 0.1 * (e.key === 'ArrowLeft' ? -1 : 1);
+      pushWaveUndo('key');
+      enterBrowse(v);
+      wave.view = { i0: v.i0 + d, i1: v.i1 + d };
+      wave.dirty = true;
+    } else handled = false;
+    if (handled && e.preventDefault) e.preventDefault();
+  }
+
+  // ---------------------------------------------------------------- 全宽显示
+  function applyWaveWide() {
+    const card = document.getElementById('wave-card');
+    const cap = document.getElementById('capture-card');
+    const on = !!(wave.settings && wave.settings.wide);
+    if (card && cap && cap.parentNode && card.parentNode) {
+      if (on && card.parentNode !== cap.parentNode) {
+        wave.homeParent = card.parentNode;
+        wave.homeNext = card.nextSibling;
+        cap.parentNode.insertBefore(card, cap);
+      } else if (!on && wave.homeParent && card.parentNode !== wave.homeParent) {
+        wave.homeParent.insertBefore(card, wave.homeNext);
+      }
+      if (card.classList) card.classList.toggle('wave-wide', on);
+    }
+    if (wave.ui.btnWide) {
+      wave.ui.btnWide.textContent = on ? '⇲ 还原' : '⛶ 全宽';
+      wave.ui.btnWide.title = on ? '恢复到右侧栏' : '波形卡片横跨两列显示 (适合分图/长时间浏览)';
+    }
+    measureStage();
+    wave.dirty = true;
+  }
+
+  // ---------------------------------------------------------------- 设置面板
+  function toggleWaveSettings(force) {
+    const el = wave.settingsEl;
+    if (!el) return;
+    wave.settingsOpen = force === undefined ? !wave.settingsOpen : !!force;
+    if (el.classList) el.classList.toggle('hidden', !wave.settingsOpen);
+    if (wave.settingsOpen) buildWaveSettingsPanel();
+  }
+
+  function waveSubscribe() {
+    if (!WC) return;   // 无 wave_core.js 时保持旧版 JSON
+    const t = wave.settings ? wave.settings.transport : 'auto';
+    const msg = { type: 'wave_subscribe', format: 'bin' };
+    if (t === 'full') msg.full = true;
+    else if (t === 'decim') msg.full = false;
+    waveSendJson(msg);
+  }
+
+  function buildWaveSettingsPanel() {
+    const host = wave.settingsEl;
+    if (!host || !document.createElement) return;
+    const s = wave.settings;
+    host.textContent = '';
+    const mk = (tag, cls, text) => {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+    const section = title => host.appendChild(mk('div', 'ws-section', title));
+    const row = (label, ...controls) => {
+      const r = mk('div', 'ws-row');
+      r.appendChild(mk('span', 'ws-label', label));
+      const box = mk('div', 'ws-ctrl');
+      controls.forEach(c => { if (c) box.appendChild(c); });
+      r.appendChild(box);
+      host.appendChild(r);
+      return r;
+    };
+    const sel = (opts, value, onChange, title) => {
+      const e = mk('select', 'custom-select wave-select');
+      opts.forEach(([v, t]) => { const o = mk('option', '', t); o.value = String(v); e.appendChild(o); });
+      e.value = String(value);
+      if (title) e.title = title;
+      e.addEventListener('change', () => onChange(e.value));
+      return e;
+    };
+    const num = (value, min, max, step, onChange, title) => {
+      const e = mk('input', 'custom-input ws-num');
+      e.type = 'number'; e.min = String(min); e.max = String(max); e.step = String(step); e.value = String(value);
+      if (title) e.title = title;
+      e.addEventListener('change', () => { const v = Number(e.value); if (Number.isFinite(v)) onChange(v); });
+      return e;
+    };
+    const chk = (checked, text, onChange, title) => {
+      const l = mk('label', 'checkbox-inline');
+      const i = mk('input');
+      i.type = 'checkbox';
+      i.checked = !!checked;
+      i.addEventListener('change', () => onChange(i.checked));
+      l.append(i, mk('span', '', text));
+      if (title) l.title = title;
+      return l;
+    };
+    const btn = (text, onClick, cls, title) => {
+      const b = mk('button', 'btn btn-xs ' + (cls || 'btn-secondary'), text);
+      if (title) b.title = title;
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    const hint = text => mk('span', 'ws-hint', text);
+    const apply = (rebuild) => { saveWaveSettings(); markDirty(); if (rebuild) buildWaveSettingsPanel(); };
+
+    const title = mk('div', 'ws-title');
+    title.append(mk('span', '', '⚙ Ch1 波形设置'), btn('✕', () => toggleWaveSettings(false), 'btn-secondary ws-close', '关闭'));
+    host.appendChild(title);
+
+    section('显示与历史');
+    row('显示范围',
+      sel([['time', '按时间'], ['points', '按点数']], s.xMode, v => { s.xMode = v; syncWindowSelect(); apply(true); }),
+      s.xMode === 'time'
+        ? num(s.windowSec, 0.01, s.historySec, 'any', v => { s.windowSec = clampNum(v, 0.01, s.historySec, 2); syncWindowSelect(); if (wave.mode !== 'live') goLive(); apply(false); }, '屏幕上一次显示的时长 (秒), 实时模式下滚轮也可调整')
+        : num(s.points, 10, 5e6, 1, v => { s.points = Math.round(clampNum(v, 10, 5e6, 2000)); syncWindowSelect(); if (wave.mode !== 'live') goLive(); apply(false); }, '屏幕上一次显示的样本点数 (VOFA+ 风格)'),
+      hint(s.xMode === 'time' ? '秒' : '点'));
+    const histSel = sel(WAVE_HISTORY_PRESETS.map(v => [v, `${v} s`]).concat(WAVE_HISTORY_PRESETS.includes(s.historySec) ? [] : [[s.historySec, `${s.historySec} s (自定义)`]]),
+      s.historySec, v => setHistory(Number(v)), '浏览器保留多久的数据可供回看');
+    const histNum = num(s.historySec, 1, 3600, 1, v => setHistory(v), '自定义历史时长 (1~3600 秒)');
+    wave.ui.memHint = hint('');
+    row('历史时长', histSel, histNum, hint('秒'), wave.ui.memHint);
+    function setHistory(v) {
+      s.historySec = clampNum(v, 1, 3600, 60);
+      if (s.windowSec > s.historySec) s.windowSec = s.historySec;
+      saveWaveSettings();
+      maybeResizeStore(true);
+      buildWaveSettingsPanel();
+    }
+
+    section('布局与纵轴');
+    row('布局', sel([['overlay', '叠加 (单图)'], ['split', '分图 (每通道一图)'], ['custom', '自定义分组']], s.layout, v => setWaveLayout(v)),
+      hint('所有子图共用横轴, 缩放/平移/光标联动'));
+    if (wave.nch) {
+      const tbl = mk('div', 'ws-table');
+      for (let c = 0; c < wave.nch; c++) {
+        const r = mk('div', 'ws-trow');
+        const dot = mk('span', 'wave-dot');
+        dot.style.backgroundColor = WAVE_COLORS[c % WAVE_COLORS.length];
+        r.append(dot, mk('span', 'ws-chname', wave.names[c] || `CH${c}`),
+          chk(wave.visible[c] !== false, '显示', on => setWaveVisible(c, on)));
+        const g = sel([1, 2, 3, 4, 5, 6, 7, 8].map(k => [k, `图 ${k}`]), s.groups[c] || 1, v => {
+          for (let k = s.groups.length; k < wave.nch; k++) s.groups[k] = 1;
+          s.groups[c] = Number(v) || 1;
+          wave.yState = {};
+          apply(true);
+        }, '自定义分组: 同组通道画在同一子图');
+        if (s.layout !== 'custom') g.disabled = true;
+        r.appendChild(g);
+        tbl.appendChild(r);
+      }
+      host.appendChild(tbl);
+      const groups = buildWaveGroups();
+      groups.forEach((gp, k) => {
+        const cfg = yCfgOf(gp.id);
+        const names = gp.chans.map(c => wave.names[c] || `CH${c}`).join(', ');
+        const setCfg = patch => {
+          s.yCfg[gp.id] = Object.assign(yCfgOf(gp.id), patch);
+          wave.yView[gp.id] = { zoom: 1, pan: 0 };
+          Object.keys(wave.yState).forEach(key => { if (key.split(':')[0] === String(gp.id)) delete wave.yState[key]; });
+          apply(true);
+        };
+        const ctrls = [sel([['per', '分通道铺满'], ['auto', '共用自动'], ['manual', '手动范围'], ['sym', '对称 ±N']], cfg.mode, v => {
+          const patch = { mode: v };
+          if (v === 'manual' && !(cfg.max > cfg.min)) {
+            const r = (wave.plots[k] && wave.plots[k].axis) || [-1, 1];
+            patch.min = Number(r[0].toPrecision(4)); patch.max = Number(r[1].toPrecision(4));
+          }
+          setCfg(patch);
+        }, '分通道铺满: 每个通道按自身范围铺满 (量纲差异大时用); 共用自动: 同组通道共用一个自动纵轴')];
+        if (cfg.mode === 'manual') {
+          ctrls.push(num(cfg.min, -1e12, 1e12, 'any', v => setCfg({ min: v }), '下限'), hint('~'),
+            num(cfg.max, -1e12, 1e12, 'any', v => setCfg({ max: v }), '上限'));
+        } else if (cfg.mode === 'sym') {
+          ctrls.push(hint('±'), num(cfg.sym, 0, 1e12, 'any', v => setCfg({ sym: Math.abs(v) }), '0 = 按数据自动对称'));
+        }
+        ctrls.push(btn('复位缩放', () => { wave.yView[gp.id] = { zoom: 1, pan: 0 }; markDirty(); }, 'btn-secondary', '清除 Shift+滚轮 / Shift+拖拽 造成的纵向缩放平移 (也可双击子图)'));
+        row(`图 ${k + 1} 纵轴`, ...ctrls).title = names;
+      });
+    }
+    row('波形高度', sel([[0, '自动'], [180, '180 px'], [240, '240 px'], [320, '320 px'], [420, '420 px'], [560, '560 px'], [720, '720 px']], s.height,
+      v => { s.height = Number(v) || 0; apply(false); }));
+
+    section('采样与传输');
+    const meta = waveParamMeta('wave_div');
+    const curDiv = wave.ackVals.wave_div !== undefined ? Number(wave.ackVals.wave_div) : (meta && meta.val !== undefined ? Number(meta.val) : NaN);
+    const divInput = num(Number.isFinite(curDiv) ? curDiv : 2, meta && meta.min !== undefined ? meta.min : 1, meta && meta.max !== undefined ? meta.max : 1000, 1, () => {}, '固件参数 wave_div: 每 N 个控制周期发送一帧 JustFloat');
+    const divBtn = btn('应用', () => {
+      const n = Math.round(Number(divInput.value));
+      if (!(n >= 1)) return;
+      waveSendRtt(`$SET:wave_div=${n}`);
+      waveLog('system', `〰️ 已下发 Ch1 采样分频 wave_div=${n}`);
+    }, 'btn-highlight');
+    wave.ui.rateHint = hint('');
+    if (!meta && wave.ackVals.wave_div === undefined) {
+      divInput.disabled = true; divBtn.disabled = true;
+      wave.ui.rateHint.textContent = '固件未注册 wave_div 参数 (RTT_REGISTER_UINT("wave_div", …)), 连接后点击 "刷新参数" 可检测';
+      row('采样分频', divInput, divBtn, wave.ui.rateHint);
+    } else {
+      row('采样分频', divInput, divBtn, wave.ui.rateHint);
+    }
+    row('传输方式', sel([['auto', '自动 (本机全速 / 局域网抽取)'], ['full', '全速 (不抽取)'], ['decim', 'min/max 抽取']], s.transport,
+      v => { s.transport = v; saveWaveSettings(); waveSubscribe(); buildWaveSettingsPanel(); }),
+      hint(wave.sub ? `当前: ${wave.sub.mode === 'full' ? '二进制全速' : wave.sub.mode === 'decim' ? '二进制抽取' : 'JSON'}${wave.sub.lan ? ' · 局域网' : ' · 本机'}` : '当前: JSON (网关未确认订阅)'));
+    row('刷新率上限', sel([[60, '60 fps'], [30, '30 fps'], [15, '15 fps']], s.fpsCap, v => { s.fpsCap = Number(v) || 60; apply(false); }),
+      hint('笔记本省电或远程桌面时可降低'));
+
+    section('选项');
+    row('显示', chk(s.markers, '参数修改标注', on => { s.markers = on; apply(false); }, '收到 $SET 的 ACK 且数值变化时, 在时间轴上画竖线并标出 旧值→新值'),
+      chk(s.smooth, '平滑滚动', on => { s.smooth = on; apply(false); }, '开: 匀速滚动, 约滞后 0.15 s; 关: 右端对齐最新样本, 延迟最低'),
+      chk(s.clearOnConnect, '重新连接时自动清空', on => { s.clearOnConnect = on; apply(false); }));
+    wave.ui.perfHint = hint('');
+    row('性能', wave.ui.perfHint);
+    const acts = mk('div', 'ws-actions');
+    acts.append(
+      btn('🗑 全部清空', () => clearAllData(), 'btn-secondary', '清空 Ch1 波形、终端、遥测看板与 Ch2 采集记录'),
+      btn('恢复默认设置', () => {
+        wave.settings = Object.assign({}, WAVE_DEFAULTS, { groups: [], yCfg: {} });
+        wave.yView = {}; wave.yState = {};
+        saveWaveSettings();
+        if (wave.ui.layoutSel) wave.ui.layoutSel.value = wave.settings.layout;
+        syncWindowSelect();
+        applyWaveWide();
+        maybeResizeStore(true);
+        markDirty();
+        buildWaveSettingsPanel();
+      }, 'btn-secondary'));
+    host.appendChild(acts);
+    host.appendChild(mk('div', 'ws-help',
+      '操作: 左键拖拽平移 · 滚轮缩放时间 (实时模式下调整窗口) · Shift+滚轮缩放纵轴 · Shift+拖拽平移纵轴 · Ctrl+拖拽框选放大 · ' +
+      '单击放置光标 A, 右键放置光标 B · 双击复位纵轴 · 空格 暂停/继续 · End 回到实时 · Ctrl+Z 撤销缩放 · Esc 清除光标 · ←/→ 平移'));
+    refreshWaveSettingsLive();
+  }
+
+  function refreshWaveSettingsLive() {
+    const ui = wave.ui;
+    if (ui.memHint) {
+      const st = wave.store, cap = wave.capInfo;
+      if (st && cap) {
+        const avail = wave.axis.timeOf(st.head) - wave.axis.timeOf(st.oldest);
+        ui.memHint.textContent = `已缓存 ${avail.toFixed(1)} s / 可回看 ${cap.seconds.toFixed(0)} s · 内存 ${(st.bytes() / 1048576).toFixed(1)} MB / ${(WAVE_MEM_LIMIT / 1048576).toFixed(0)} MB${cap.limited ? ' (受内存上限限制)' : ''}`;
+      } else ui.memHint.textContent = '等待数据…';
+    }
+    if (ui.rateHint && !(ui.rateHint.textContent || '').startsWith('固件未注册')) {
+      const fps = wave.fps;
+      const div = Number(wave.ackVals.wave_div);
+      ui.rateHint.textContent = fps > 0
+        ? `实测 ${fps.toFixed(0)} 帧/s · 周期 ${(1000 / fps).toFixed(2)} ms${div > 0 ? ` · 基础循环约 ${(fps * div).toFixed(0)} Hz` : ''}`
+        : '尚未收到 Ch1 数据';
+    }
+    if (ui.perfHint) {
+      ui.perfHint.textContent = `渲染 ${wave.perf.ms.toFixed(2)} ms (p95 ${wave.perf.p95.toFixed(2)} ms) · ${wave.perf.vertices} 顶点 · 网格重绘 ${wave.perf.gridDraws} 次 / ${wave.perf.frames} 帧`;
+    }
   }
 
   // ================= 终端输出与交互 =================
@@ -1429,12 +2528,14 @@
     sendJson: sendJson,
     logTerminal: logTerminal,
     isConnected: () => isConnected,
-    getCh1Snapshot: () => ({
-      sample_hz: Math.max(1, Math.round(wave.displayRate || wave.fps || 100)),
-      nch: wave.nch,
-      names: wave.names.slice(0, wave.nch),
-      channels: wave.ch.slice(0, wave.nch).map(a => a.slice())
-    })
+    // kind: 'analysis' (默认: A-B 光标区间, 否则当前视图) | 'export' (A-B 区间, 否则全部历史)
+    getCh1Snapshot: (kind) => getCh1Snapshot(kind),
+    // v3.1 波形面板调试/自动化接口
+    wave: {
+      state: wave, clear: clearWave, clearAll: clearAllData, goLive, pause: toggleWavePause, undo: undoWaveView,
+      setLayout: setWaveLayout, setCursor: setWaveCursor, exportCsv: exportWaveCsv, openSettings: toggleWaveSettings,
+      render: renderWaveFrame
+    }
   };
 
   // 页面加载完成后启动

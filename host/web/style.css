@@ -1024,6 +1024,220 @@ body {
   min-width: 70px;
 }
 
+/* ---- v3.1 Ch1 波形: 三层画布 / 概览条 / 读数条 / 设置面板 ---- */
+.wave-card-header {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.wave-card-header .wave-toolbar {
+  flex-wrap: wrap;
+  flex-shrink: 1;
+  justify-content: flex-end;
+  gap: 6px;
+}
+#wave-card.wave-wide {
+  grid-column: 1 / -1;
+}
+.wave-container {
+  padding: 8px 12px 6px;
+}
+.wave-stage {
+  position: relative;
+  width: 100%;
+  height: 240px;
+  outline: none;
+  user-select: none;
+  touch-action: none;
+}
+.wave-stage:focus-visible {
+  box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.5);
+}
+.wave-stage.wave-browsing {
+  box-shadow: inset 0 0 0 1px rgba(210, 153, 34, 0.45);
+}
+.wave-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+}
+.wave-layer-top {
+  cursor: crosshair;
+}
+.wave-browsing .wave-layer-top {
+  cursor: grab;
+}
+.wave-browsing .wave-layer-top:active {
+  cursor: grabbing;
+}
+.wave-overview {
+  display: block;
+  width: 100%;
+  height: 36px;
+  margin-top: 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.wave-tip {
+  position: absolute;
+  display: none;
+  pointer-events: none;
+  z-index: 3;
+  min-width: 120px;
+  padding: 5px 8px;
+  background: rgba(13, 17, 23, 0.92);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font: 11px ui-monospace, Consolas, monospace;
+  color: var(--text-main);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+.wave-tip-time {
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+.wave-tip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 16px;
+}
+.wave-tip-row.hidden {
+  display: none;
+}
+.wave-tip-row .wave-dot {
+  width: 8px;
+  height: 8px;
+  cursor: default;
+}
+.wave-tip-name {
+  flex: 1;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wave-tip-val {
+  color: var(--accent-green-bright);
+  text-align: right;
+  min-width: 64px;
+}
+.wave-live-pill {
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  z-index: 4;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.wave-readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  min-height: 18px;
+  padding-top: 4px;
+  font: 11px ui-monospace, Consolas, monospace;
+  color: var(--text-muted);
+}
+.wave-ro-cursor {
+  color: #ffa657;
+  flex: 1;
+}
+.wave-ro-perf {
+  margin-left: auto;
+  color: var(--text-dim, #6e7681);
+}
+.wave-settings {
+  margin: 0 12px 8px;
+  padding: 8px 12px 10px;
+  background: rgba(22, 27, 34, 0.96);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.wave-settings.hidden {
+  display: none;
+}
+.ws-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.ws-section {
+  margin: 8px 0 4px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--accent-cyan);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+}
+.ws-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+.ws-label {
+  flex: 0 0 76px;
+  color: var(--text-main);
+}
+.ws-ctrl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ws-num {
+  width: 84px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+.ws-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.ws-table {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 2px 0 4px 84px;
+}
+.ws-trow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ws-chname {
+  color: var(--text-main);
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.ws-help {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.ws-close {
+  padding: 0 6px;
+}
+.wave-settings .btn:disabled,
+.wave-settings input:disabled,
+.wave-settings select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ================= v3: Ch2 触发采集与时频分析面板 ================= */
 .capture-card {
   grid-column: 1 / -1;

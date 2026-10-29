@@ -323,34 +323,54 @@
       </div>
 
       <!-- Ch1 高速波形 (JustFloat): 与 VOFA+ 同源 (两者都直接读 OpenOCD 19022) -->
+      <!-- v3.1: 环形缓冲 (默认 60 s 可回看) + 三层画布 + 实时/浏览状态机 + 叠加/分图/自定义分组 -->
       <div class="card chart-card" id="wave-card">
-        <div class="card-header">
+        <div class="card-header wave-card-header">
           <div class="card-title">
             <span class="card-icon">〰️</span>
             <h3>Ch1 波形 (JustFloat，与 VOFA+ 同源)</h3>
           </div>
           <div class="wave-toolbar">
             <span class="tele-rate-badge" id="wave-info" title="帧率 / 通道数 / 抽取倍数 / 重同步次数">未接收</span>
-            <select id="wave-scale" class="custom-select wave-select" title="分通道缩放: 每个通道按自身最小/最大值铺满高度, 适合量纲差别大的通道 (如 ±1 的正弦与 1500 的转速)">
-              <option value="per" selected>分通道缩放</option>
-              <option value="shared">共用纵轴</option>
-            </select>
-            <select id="wave-window" class="custom-select wave-select" title="显示时间窗">
+            <select id="wave-window" class="custom-select wave-select" title="显示时间窗 (实时模式下滚轮也可调整; 设置中可切换为按点数显示)">
+              <option value="0.1">0.1 s</option>
+              <option value="0.2">0.2 s</option>
+              <option value="0.5">0.5 s</option>
               <option value="1">1 s</option>
               <option value="2" selected>2 s</option>
               <option value="5">5 s</option>
               <option value="10">10 s</option>
+              <option value="20">20 s</option>
+              <option value="30">30 s</option>
+              <option value="60">60 s</option>
             </select>
-            <button id="btn-wave-pause" class="btn btn-xs btn-secondary" title="冻结画面 (后台继续接收)">暂停</button>
-            <button id="btn-wave-analyze" class="btn btn-xs btn-secondary" title="将当前 Ch1 缓存送入下方阶跃/FFT/STFT分析面板">送入分析</button>
-            <button id="btn-wave-csv" class="btn btn-xs btn-secondary" title="将当前 Ch1 缓存波形导出为 CSV">导出 CSV</button>
+            <select id="wave-layout" class="custom-select wave-select" title="叠加: 全部通道一张图; 分图: 每通道一张图; 自定义: 在设置中分组">
+              <option value="overlay" selected>叠加</option>
+              <option value="split">分图</option>
+              <option value="custom">自定义</option>
+            </select>
+            <button id="btn-wave-pause" class="btn btn-xs btn-secondary" title="停止跟随 (后台继续接收), 进入历史浏览; 快捷键 空格">⏸ 暂停</button>
+            <button id="btn-wave-clear" class="btn btn-xs btn-secondary" title="清空 Ch1 波形缓存、光标与参数标注">🗑 清空</button>
+            <button id="btn-wave-settings" class="btn btn-xs btn-secondary" title="显示范围 / 历史时长 / 布局与纵轴 / 采样分频 / 传输方式">⚙ 设置</button>
+            <button id="btn-wave-analyze" class="btn btn-xs btn-secondary" title="送入下方阶跃/FFT/STFT 分析面板: 有 A、B 光标时取光标区间, 否则取当前视图">送入分析</button>
+            <button id="btn-wave-csv" class="btn btn-xs btn-secondary" title="导出 CSV: 有 A、B 光标时导出光标区间, 否则导出全部历史">导出 CSV</button>
+            <button id="btn-wave-wide" class="btn btn-xs btn-secondary" title="波形卡片横跨两列显示">⛶ 全宽</button>
           </div>
         </div>
+        <div id="wave-settings" class="wave-settings hidden"></div>
         <div id="wave-legend" class="wave-legend">
           <span class="wave-empty-hint">等待 RTT Channel 1 的 JustFloat 数据 (固件 <code>RTT_Send_JustFloat*</code>)… 通道名可点击修改</span>
         </div>
-        <div class="chart-container">
-          <canvas id="waveCanvas" width="540" height="220"></canvas>
+        <div class="chart-container wave-container">
+          <div id="waveStage" class="wave-stage" tabindex="0">
+            <canvas id="waveGrid" class="wave-layer"></canvas>
+            <canvas id="waveCanvas" class="wave-layer"></canvas>
+            <canvas id="waveOverlay" class="wave-layer wave-layer-top"></canvas>
+            <div id="wave-tip" class="wave-tip"></div>
+            <button id="btn-wave-live" class="btn btn-xs btn-highlight wave-live-pill hidden" title="回到实时跟随 (End)">⏩ 回到实时</button>
+          </div>
+          <canvas id="waveOverview" class="wave-overview" title="全部历史概览: 拖动蓝框平移, 点击跳转"></canvas>
+          <div id="wave-readout" class="wave-readout"></div>
         </div>
       </div>
 
@@ -470,6 +490,7 @@
   </main>
 
   <script src="analysis.js"></script>
+  <script src="wave_core.js"></script>
   <script src="app.js"></script>
   <script src="capture_panel.js"></script>
 </body>

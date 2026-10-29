@@ -308,6 +308,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  /* 栅格子项默认 min-width:auto, 内部较宽的画布/工具栏会把本列撑大、挤窄另一列; 设为 0 允许按比例收缩 */
+  min-width: 0;
 }
 
 /* ================= 卡片容器 ================= */
@@ -1401,3 +1403,129 @@ body {
   font-size: 10.5px;
   color: var(--text-dim);
 }
+
+
+/* ==========================================================================
+   v3.1 滑动条下发时机切换 (拖动即发 / 松手发送) + 主题切换按钮
+   ========================================================================== */
+.seg-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background-color: var(--bg-tertiary);
+}
+.seg-btn {
+  white-space: nowrap;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background-color 0.15s, color 0.15s;
+}
+.seg-btn + .seg-btn {
+  border-left: 1px solid var(--border-color);
+}
+.seg-btn:hover {
+  color: var(--text-main);
+}
+.seg-btn.active {
+  background-color: var(--accent-blue);
+  color: #fff;
+}
+.seg-toggle.disabled {
+  opacity: 0.45;
+}
+.param-ack-badge.ack-pending {
+  background-color: rgba(88, 166, 255, 0.12);
+  color: var(--accent-blue-bright);
+  border-color: var(--accent-blue-bright);
+  border-style: dashed;
+}
+.btn-theme {
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* ==========================================================================
+   v3.1 浅色 (白色) 主题: <html data-theme="light">, 由 theme.js 在首次绘制前设置
+   颜色参考 GitHub Light, 文本对比度均 ≥ 4.5:1 (WCAG AA)
+   ========================================================================== */
+:root[data-theme="light"] {
+  --bg-primary: #f3f5f8;
+  --bg-secondary: #f8f9fb;
+  --bg-tertiary: #eaeef2;
+  --bg-card: #ffffff;
+  --bg-input: #ffffff;
+
+  --border-color: #d0d7de;
+  --border-focus: #0969da;
+
+  --text-main: #1f2328;
+  --text-muted: #59636e;
+  --text-dim: #6e7781;
+
+  --accent-blue: #0969da;
+  --accent-blue-hover: #0860ca;
+  --accent-green: #1f883d;
+  --accent-green-bright: #1a7f37;
+  --accent-orange: #9a6700;
+  --accent-red: #cf222e;
+  --accent-purple: #8250df;
+  --accent-cyan: #127a83;
+  --accent-blue-bright: #0969da;
+  --accent-pink: #bf3989;
+
+  --shadow-sm: 0 1px 3px rgba(31, 35, 40, 0.08);
+  --shadow-md: 0 4px 12px rgba(31, 35, 40, 0.12);
+  --shadow-glow: 0 0 10px rgba(26, 127, 55, 0.25);
+}
+[data-theme="light"] .btn-secondary:hover { background-color: #e3e8ee; }
+[data-theme="light"] .param-row:hover { border-color: #afb8c1; }
+[data-theme="light"] .btn-step:hover { background-color: #dde3ea; }
+[data-theme="light"] .chart-container,
+[data-theme="light"] #capCanvas,
+[data-theme="light"] #fftCanvas,
+[data-theme="light"] #stftCanvas { background-color: #ffffff; }
+[data-theme="light"] .terminal-body { background-color: #fbfcfd; }
+[data-theme="light"] .log-line.system { color: #59636e; }
+[data-theme="light"] .log-line.tx { color: #0550ae; }
+[data-theme="light"] .log-line.rx { color: #6639ba; }
+[data-theme="light"] .log-line.ack-ok { color: #1a7f37; }
+[data-theme="light"] .log-line.ack-err { color: #cf222e; }
+[data-theme="light"] .log-line.telemetry { color: #6e7781; }
+[data-theme="light"] .target-dot { background-color: #0969da; }
+[data-theme="light"] .actual-dot { background-color: #1a7f37; }
+[data-theme="light"] .tele-metric-tile {
+  background: linear-gradient(145deg, #ffffff, #f6f8fa);
+  box-shadow: 0 1px 3px rgba(31, 35, 40, 0.08);
+}
+[data-theme="light"] .tele-metric-name.tele-name-renamable { border-bottom-color: rgba(31, 35, 40, 0.25); }
+[data-theme="light"] .tele-metric-unit { border-color: rgba(31, 35, 40, 0.1); }
+[data-theme="light"] .tele-metric-val { color: #0969da; }
+[data-theme="light"] .tele-metric-tile.type-voltage .tele-metric-val,
+[data-theme="light"] .tele-metric-tile.type-voltage .tele-metric-unit { color: #bc4c00; }
+[data-theme="light"] .tele-metric-tile.type-current .tele-metric-val,
+[data-theme="light"] .tele-metric-tile.type-current .tele-metric-unit { color: #127a83; }
+[data-theme="light"] .tele-metric-tile.type-power .tele-metric-val,
+[data-theme="light"] .tele-metric-tile.type-power .tele-metric-unit { color: #cf222e; }
+[data-theme="light"] .tele-metric-tile.type-temp .tele-metric-val,
+[data-theme="light"] .tele-metric-tile.type-temp .tele-metric-unit { color: #9a6700; }
+[data-theme="light"] .wave-tip {
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 4px 12px rgba(31, 35, 40, 0.15);
+}
+[data-theme="light"] .wave-live-pill { box-shadow: 0 2px 8px rgba(31, 35, 40, 0.2); }
+[data-theme="light"] .wave-ro-cursor { color: #bc4c00; }
+[data-theme="light"] .wave-settings { background: #ffffff; box-shadow: var(--shadow-md); }
+[data-theme="light"] .cap-controls { background-color: #f8f9fb; }
+[data-theme="light"] .cap-tab:hover { background-color: rgba(31, 35, 40, 0.05); }
+[data-theme="light"] .cap-metric-box.highlight { background: linear-gradient(145deg, #ffffff, #eef7f8); }
+[data-theme="light"] .param-ack-badge.ack-success { box-shadow: none; }
+
+.card-actions { flex-wrap: wrap; }
+.toggle-text { white-space: nowrap; }
+.wave-container { min-width: 0; overflow: hidden; }

@@ -509,11 +509,22 @@
   // ===========================================================================
   // 渲染器 (三层: 网格层 / 波形层 / 交互层; 坐标统一用 CSS 像素)
   // ===========================================================================
+  // 画布配色 (默认深色)。浅色主题由页面通过 setTheme(RTTTheme.canvas()) 覆盖; 本模块不读取 DOM/CSS。
   const THEME = {
-    bg: 'rgba(0,0,0,0)', grid: '#1e2430', gridStrong: '#2a3140', zero: '#3a4250', frame: '#30363d',
+    grid: '#1e2430', gridStrong: '#2a3140', zero: '#3a4250', frame: '#30363d',
     text: '#8b949e', textDim: '#6e7681', cursorA: '#ffa657', cursorB: '#d2a8ff', marker: '#e3b341',
+    labelBg: 'rgba(13,17,23,0.85)', cursorText: '#0d1117', crosshair: 'rgba(230,237,243,0.45)', dotStroke: '#0d1117',
+    overviewBg: 'rgba(22,27,34,0.9)', select: 'rgba(88,166,255,0.15)', selectStroke: 'rgba(88,166,255,0.8)',
+    window: 'rgba(88,166,255,0.18)', windowStroke: 'rgba(88,166,255,0.9)',
     font: '11px ui-monospace, Consolas, monospace'
   };
+
+  /** 覆盖画布配色 (只接受已知键, 忽略其他字段) */
+  function setTheme(colors) {
+    if (!colors) return THEME;
+    Object.keys(THEME).forEach(k => { if (k !== 'font' && typeof colors[k] === 'string') THEME[k] = colors[k]; });
+    return THEME;
+  }
 
   function clearLayer(ctx, w, h) {
     ctx.clearRect(0, 0, w, h);
@@ -692,7 +703,7 @@
         const tw = ctx.measureText(m.text).width + 6;
         const lx = Math.min(x + 2, x1 - tw);
         const ly = top + 2 + row * 14;
-        ctx.fillStyle = 'rgba(13,17,23,0.85)';
+        ctx.fillStyle = THEME.labelBg;
         ctx.fillRect(lx, ly, tw, 13);
         ctx.fillStyle = THEME.marker;
         ctx.fillText(m.text, lx + 3, ly + 1);
@@ -709,7 +720,7 @@
       ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
       ctx.fillStyle = col;
       ctx.fillRect(x - 7, bottom - 14, 14, 14);
-      ctx.fillStyle = '#0d1117';
+      ctx.fillStyle = THEME.cursorText;
       ctx.textAlign = 'center';
       ctx.fillText(label, x, bottom - 13);
       ctx.textAlign = 'left';
@@ -724,9 +735,9 @@
     if (select && plots.length) {
       const top = plots[0].y0, bottom = plots[plots.length - 1].y1;
       const xa = Math.min(select.x0, select.x1), xb = Math.max(select.x0, select.x1);
-      ctx.fillStyle = 'rgba(88,166,255,0.15)';
+      ctx.fillStyle = THEME.select;
       ctx.fillRect(xa, top, xb - xa, bottom - top);
-      ctx.strokeStyle = 'rgba(88,166,255,0.8)';
+      ctx.strokeStyle = THEME.selectStroke;
       ctx.strokeRect(xa + 0.5, top + 0.5, xb - xa, bottom - top);
     }
     if (!hover || !plots.length) return;
@@ -734,7 +745,7 @@
     if (hover.x < p0.x0 || hover.x > p0.x1) return;
     const top = p0.y0, bottom = plots[plots.length - 1].y1;
     const x = Math.round(hover.sx !== undefined ? hover.sx : hover.x) + 0.5;
-    ctx.strokeStyle = 'rgba(230,237,243,0.45)';
+    ctx.strokeStyle = THEME.crosshair;
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 2]);
     ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
@@ -747,7 +758,7 @@
         if (!isFin(pt.y)) continue;
         ctx.fillStyle = pt.color;
         ctx.beginPath(); ctx.arc(x - 0.5, pt.y, 3.2, 0, Math.PI * 2); ctx.fill();
-        ctx.strokeStyle = '#0d1117';
+        ctx.strokeStyle = THEME.dotStroke;
         ctx.stroke();
       }
     }
@@ -757,7 +768,7 @@
   function drawOverview(ctx, o) {
     const { w, h, store, chans, colors, view } = o;
     clearLayer(ctx, w, h);
-    ctx.fillStyle = 'rgba(22,27,34,0.9)';
+    ctx.fillStyle = THEME.overviewBg;
     ctx.fillRect(0, 0, w, h);
     if (!store || store.count < 2) return null;
     const a = store.oldest, b = store.head;
@@ -791,16 +802,16 @@
     const xa = x0 + (Math.max(view.i0, a) - a) / (b - a) * pw;
     const xb = x0 + (Math.min(view.i1, b) - a) / (b - a) * pw;
     const rx = Math.min(xa, x1 - 4), rw = Math.max(4, xb - xa);
-    ctx.fillStyle = 'rgba(88,166,255,0.18)';
+    ctx.fillStyle = THEME.window;
     ctx.fillRect(rx, 0, rw, h);
-    ctx.strokeStyle = 'rgba(88,166,255,0.9)';
+    ctx.strokeStyle = THEME.windowStroke;
     ctx.lineWidth = 1;
     ctx.strokeRect(rx + 0.5, 0.5, rw - 1, h - 1);
     return { x0, x1, a, b, xa: rx, xb: rx + rw };
   }
 
   return {
-    PYR_FACTOR, PYR_LEVELS, MEM_FACTOR, MIN_CAPACITY, WAVE_BIN_HEADER, THEME,
+    PYR_FACTOR, PYR_LEVELS, MEM_FACTOR, MIN_CAPACITY, WAVE_BIN_HEADER, THEME, setTheme,
     isFin, WaveStore, planCapacity, TimeAxis,
     niceStep, niceRange, stabilizeRange, applyYView, stepDecimals, fmtNum, fmtTime, timeTicks,
     decodeWaveBinary, encodeWaveBinary,

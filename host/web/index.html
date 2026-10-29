@@ -4,12 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>STM32 SEGGER RTT 实时调参控制台</title>
+  <!-- v3.1: 主题需在首次绘制前确定 (同步加载, 避免深/浅色闪烁) -->
+  <script src="theme.js"></script>
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
-<body class="dark-theme">
+<body>
 
   <!-- 顶部导航栏 -->
   <header class="app-header">
@@ -91,6 +93,8 @@
           <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
         </svg>
       </button>
+
+      <button id="btn-theme" class="btn btn-secondary btn-icon-only btn-theme" title="切换浅色 (白色) 主题">☀️</button>
     </div>
   </header>
 
@@ -108,11 +112,15 @@
             <h3>PID 控制器核心参数</h3>
           </div>
           <div class="card-actions">
-            <label class="toggle-label" title="滑动条拖动时自动实时下发">
+            <label class="toggle-label" title="开: 拖动滑动条即自动下发; 关: 只在输入框回车 / 点击发送按钮时下发">
               <input type="checkbox" id="auto-sync-toggle" checked>
               <span class="toggle-slider"></span>
               <span class="toggle-text">实时同步</span>
             </label>
+            <div class="seg-toggle" id="slider-send-mode" role="radiogroup" title="滑动条的下发时机 (所有参数滑动条通用, 保存在浏览器本地)">
+              <button type="button" class="seg-btn active" data-mode="live" role="radio" aria-checked="true" title="拖动过程中实时下发 (约每 50 ms 一次, 松手时补发最终值)">拖动即发</button>
+              <button type="button" class="seg-btn" data-mode="release" role="radio" aria-checked="false" title="拖动时只预览数值, 松开鼠标后才下发一次 (适合大幅调整, 避免中间值冲击被控对象)">松手发送</button>
+            </div>
             <button id="btn-refresh-all" class="btn btn-sm btn-secondary" title="向单片机请求全部参数最新值 ($GET:ALL)">
               🔄 刷新全部
             </button>

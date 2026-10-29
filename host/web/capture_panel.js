@@ -21,7 +21,21 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const COLORS = ['#58a6ff', '#3fb950', '#d29922', '#f778ba', '#a371f7', '#39c5bb', '#f85149', '#e6edf3'];
+  // v3.1: 配色随主题 (theme.js) 切换; Node 测试或未加载 theme.js 时使用深色默认值
+  const DARK_COLORS = ['#58a6ff', '#3fb950', '#d29922', '#f778ba', '#a371f7', '#39c5bb', '#f85149', '#e6edf3'];
+  const DARK_CANVAS = { grid: '#1e2430', text: '#8b949e', trigger: '#d29922', band: 'rgba(63, 185, 80, 0.45)',
+                        peak: '#f85149', spectrum: '#39c5bb', cursorA: '#58a6ff', cursorB: '#f778ba' };
+  const COLORS = DARK_COLORS.slice();
+  let TH = Object.assign({}, DARK_CANVAS);
+  function themeApi() { return (typeof window !== 'undefined' && window.RTTTheme) || null; }
+  function loadTheme() {
+    const T = themeApi();
+    const pal = T ? T.palette() : DARK_COLORS;
+    for (let k = 0; k < COLORS.length; k++) COLORS[k] = pal[k % pal.length];
+    TH = Object.assign({}, DARK_CANVAS, T ? T.canvas() : {});
+    if (T) { TH.cursorA = pal[0]; TH.cursorB = pal[3]; }
+  }
+  loadTheme();
   const MAX_HISTORY = 10;
 
   const state = {
@@ -161,6 +175,8 @@
     ];
     ids.forEach(id => { els[id] = document.getElementById(id); });
     if (!els['capCanvas']) return;
+    const T = themeApi();
+    if (T && typeof T.onChange === 'function') T.onChange(onThemeChange);
 
     populateChannelSelects(state.names);
 
@@ -448,6 +464,16 @@
     sel.value = '0';
   }
 
+  /** v3.1: 主题切换后重绘图例圆点、采集画布与当前分析页 */
+  function onThemeChange() {
+    loadTheme();
+    if (state.current) {
+      rebuildLegend(state.current);
+      runActiveAnalysis();
+    }
+    drawCaptureCanvas();
+  }
+
   /** v3.1: 清空采集记录与画布 (波形面板 "全部清空" 调用) */
   function clearHistory() {
     state.history = [];
@@ -651,7 +677,7 @@
     c.clearRect(0, 0, w, h);
 
     // 网格
-    c.strokeStyle = '#1e2430';
+    c.strokeStyle = TH.grid;
     c.lineWidth = 1;
     for (let y = 24; y < h; y += 44) {
       c.beginPath(); c.moveTo(0, y); c.lineTo(w, y); c.stroke();
@@ -721,12 +747,12 @@
     // 触发位置竖线 (黄色虚线)
     if (cap.trigger_index >= s0 && cap.trigger_index < s1) {
       const tx = xOfIdx(cap.trigger_index);
-      c.strokeStyle = '#d29922';
+      c.strokeStyle = TH.trigger;
       c.lineWidth = 1.2;
       c.setLineDash([4, 4]);
       c.beginPath(); c.moveTo(tx, 0); c.lineTo(tx, h); c.stroke();
       c.setLineDash([]);
-      c.fillStyle = '#d29922';
+      c.fillStyle = TH.trigger;
       c.font = '11px monospace';
       c.fillText('T=0 (Trig)', Math.min(w - 70, tx + 4), 14);
     }
@@ -739,7 +765,7 @@
       if (r) {
         // 终值水平参考线 yf
         const y1Px = yIn(sr.yf, r);
-        c.strokeStyle = 'rgba(63, 185, 80, 0.45)';
+        c.strokeStyle = TH.band;
         c.setLineDash([2, 4]);
         c.beginPath(); c.moveTo(0, y1Px); c.lineTo(w, y1Px); c.stroke();
         c.setLineDash([]);
@@ -750,7 +776,7 @@
           const px = xOfIdx(idxPeak);
           const yPeakVal = cap.channels[yCh][idxPeak];
           const py = yIn(yPeakVal, r);
-          c.fillStyle = '#f85149';
+          c.fillStyle = TH.peak;
           c.beginPath(); c.arc(px, py, 4, 0, Math.PI * 2); c.fill();
           c.fillText(`Peak (${sr.overshootPct.toFixed(1)}%)`, Math.min(w - 95, px + 6), Math.max(14, py - 6));
         }
@@ -770,11 +796,11 @@
       c.font = '11px monospace';
       c.fillText(label, Math.min(w - 20, x + 3), h - 6);
     };
-    drawCursor(state.cursorA, 'A', '#58a6ff');
-    drawCursor(state.cursorB, 'B', '#f778ba');
+    drawCursor(state.cursorA, 'A', TH.cursorA);
+    drawCursor(state.cursorB, 'B', TH.cursorB);
 
     // 顶部视图范围提示
-    c.fillStyle = '#8b949e';
+    c.fillStyle = TH.text;
     c.font = '11px monospace';
     const t0Ms = (((s0 - cap.trigger_index) / cap.sample_hz) * 1000).toFixed(2);
     const t1Ms = (((s1 - 1 - cap.trigger_index) / cap.sample_hz) * 1000).toFixed(2);
@@ -975,7 +1001,7 @@
     const ph = Math.max(40, h - padT - padB);
 
     // 背景网格
-    c.strokeStyle = '#1e2430';
+    c.strokeStyle = TH.grid;
     c.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = padT + (i / 4) * ph;
@@ -999,7 +1025,7 @@
     const yOfVal = v => padT + (1 - Math.max(0, Math.min(1, (v - yMin) / Math.max(1e-9, yMax - yMin)))) * ph;
 
     // 频谱曲线
-    c.strokeStyle = '#39c5bb';
+    c.strokeStyle = TH.spectrum;
     c.lineWidth = 1.5;
     c.beginPath();
     for (let k = 0; k <= maxBin; k++) {
@@ -1011,7 +1037,7 @@
     c.stroke();
 
     // 峰值标注
-    c.fillStyle = '#f85149';
+    c.fillStyle = TH.peak;
     c.font = '11px monospace';
     peaks.slice(0, 5).forEach((p, idx) => {
       if (p.f > fMax) return;
@@ -1023,7 +1049,7 @@
     });
 
     // 坐标轴刻度
-    c.fillStyle = '#8b949e';
+    c.fillStyle = TH.text;
     c.font = '11px monospace';
     c.fillText(scaleMode === 'db' ? `${yMax.toFixed(0)}dB` : yMax.toPrecision(3), 4, padT + 8);
     c.fillText(scaleMode === 'db' ? `${yMin.toFixed(0)}dB` : '0', 4, padT + ph);
@@ -1138,7 +1164,7 @@
     }
 
     // 坐标轴文字
-    c.fillStyle = '#8b949e';
+    c.fillStyle = TH.text;
     c.font = '11px monospace';
     const fMax = res.freqs[nF - 1] || 1;
     c.fillText(`${fMax >= 1000 ? (fMax / 1000).toFixed(1) + 'k' : fMax.toFixed(0)}Hz`, 4, padT + 10);
@@ -1207,6 +1233,7 @@
     onCapture,
     importCh1Snapshot,
     clearHistory,
+    onThemeChange,
     runStepAnalysis,
     runFftAnalysis,
     runStftAnalysis,

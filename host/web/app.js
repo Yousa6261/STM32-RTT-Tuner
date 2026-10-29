@@ -20,9 +20,6 @@
     actual: new Array(MAX_HISTORY).fill(0)
   };
 
-  // 防抖计时器集合
-  const debounceTimers = {};
-
   // ================= DOM 元素映射 =================
   const els = {
     connMode: document.getElementById('conn-mode'),
@@ -75,14 +72,27 @@
     setupCanvas();
     startRenderLoop();
     setupWavePanel();
+    setupSliderModeToggle();
+    if (window.RTTTheme && typeof window.RTTTheme.onChange === 'function') {
+      window.RTTTheme.onChange(() => { canvasTheme = themeCanvas(); });
+    }
 
     els.btnConnect.addEventListener('click', toggleConnect);
     els.btnPing.addEventListener('click', sendPing);
     els.btnRefreshAll.addEventListener('click', () => sendRttCommand('$GET:ALL'));
     els.autoSyncToggle.addEventListener('change', (e) => {
       autoSyncEnabled = e.target.checked;
+      syncSliderModeEnabled();
     });
   }
+
+  // v3.1 主题: 画布颜色取自 theme.js (CSS 变量无法用于 canvas); 未加载 theme.js 时使用深色默认值
+  function themeCanvas() {
+    return (window.RTTTheme && typeof window.RTTTheme.canvas === 'function')
+      ? window.RTTTheme.canvas()
+      : { grid: '#1e2430', target: '#58a6ff', actual: '#3fb950' };
+  }
+  let canvasTheme = themeCanvas();
 
   // ================= 芯片预设切换 =================
   // v3 P0: 预设来自 chips.json (与网关共用的单一数据源)。加载失败 (如直接用 file:// 打开) 时
@@ -401,12 +411,13 @@
     }
   }
 
-  function updateAckBadge(paramName, className, text) {
+  function updateAckBadge(paramName, className, text, sticky = false) {
     const badge = document.getElementById(`ack-${paramName}`);
     if (badge) {
       badge.className = `param-ack-badge ${className}`;
       badge.textContent = text;
-      
+      if (sticky) return;   // 例如 "松手后发送" 预览: 保持显示直到松手下发
+
       // 3秒后淡化为已就绪
       setTimeout(() => {
         if (badge.classList.contains(className)) {
@@ -418,6 +429,110 @@
   }
 
   // ================= 参数双向绑定 =================
+
+  // v3.1: 滑动条下发时机可切换 (所有参数滑动条通用, 保存在浏览器本地 localStorage 'sliderSendMode'):
+  //   'live'    拖动即发: 拖动过程中节流下发 (每 SLIDER_THROTTLE_MS 最多一次, 首次立即发), 松手时补发最终值;
+  //             旧实现是 40ms "尾随防抖": 连续拖动时 input 事件间隔约 16ms < 40ms, 实际要停顿才会发出, 并不实时。
+  //   'release' 松手发送: 拖动时只在数字框与 ACK 标签预览数值, 松开鼠标 (change 事件) 时下发一次,
+  //             适合大幅调整 Kp / 目标转速等参数, 避免中间值逐个冲击被控对象。
+  // "实时同步" 开关关闭时, 两种模式都不自动下发 (只在输入框回车 / 点击发送时下发)。
+  const SLIDER_MODE_KEY = 'sliderSendMode';
+  const SLIDER_THROTTLE_MS = 50;
+  let sliderSendMode = loadSliderSendMode();
+  const sliderSendState = {};   // name -> { last, timer, pending, sent }
+
+  function loadSliderSendMode() {
+    try { return localStorage.getItem(SLIDER_MODE_KEY) === 'release' ? 'release' : 'live'; } catch (e) { return 'live'; }
+  }
+
+  function setSliderSendMode(mode) {
+    sliderSendMode = mode === 'release' ? 'release' : 'live';
+    try { localStorage.setItem(SLIDER_MODE_KEY, sliderSendMode); } catch (e) { /* 隐私模式 */ }
+    const group = document.getElementById('slider-send-mode');
+    if (group) {
+      group.querySelectorAll('.seg-btn').forEach(b => {
+        const on = b.dataset.mode === sliderSendMode;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-checked', on ? 'true' : 'false');
+      });
+    }
+  }
+
+  function syncSliderModeEnabled() {
+    const group = document.getElementById('slider-send-mode');
+    if (group) group.classList.toggle('disabled', !autoSyncEnabled);
+  }
+
+  function setupSliderModeToggle() {
+    const group = document.getElementById('slider-send-mode');
+    if (group) group.querySelectorAll('.seg-btn').forEach(b => b.addEventListener('click', () => setSliderSendMode(b.dataset.mode)));
+    setSliderSendMode(sliderSendMode);
+    syncSliderModeEnabled();
+  }
+
+  function sliderState(name) {
+    if (!sliderSendState[name]) sliderSendState[name] = { last: -Infinity, timer: null, pending: null, sent: null };
+    return sliderSendState[name];
+  }
+
+  /** 节流下发: 距上次下发 ≥ SLIDER_THROTTLE_MS 立即发, 否则排队到间隔结束 (只保留最新值) */
+  function throttleSend(name, value) {
+    const st = sliderState(name);
+    st.pending = String(value);
+    const wait = SLIDER_THROTTLE_MS - (performance.now() - st.last);
+    if (wait <= 0) flushSliderSend(name);
+    else if (!st.timer) st.timer = setTimeout(() => flushSliderSend(name), wait);
+  }
+
+  /** 立即下发排队中的值; endOfDrag=true 表示一次拖动结束 (同一次拖动内相同值不重复下发) */
+  function flushSliderSend(name, finalValue, endOfDrag) {
+    const st = sliderState(name);
+    if (finalValue !== undefined) st.pending = String(finalValue);
+    if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+    if (st.pending !== null && st.pending !== st.sent) {
+      sendParamUpdate(name, st.pending);
+      st.sent = st.pending;
+      st.last = performance.now();
+    }
+    st.pending = null;
+    if (endOfDrag) st.sent = null;
+  }
+
+  function cancelSliderSend(name) {
+    const st = sliderSendState[name];
+    if (!st) return;
+    if (st.timer) clearTimeout(st.timer);
+    st.timer = null;
+    st.pending = null;
+    st.sent = null;
+  }
+
+  /** 绑定一组 "滑动条 + 数字框" (固定参数与动态注册参数共用) */
+  function bindParamSlider(name, slider, input) {
+    slider.addEventListener('input', () => {
+      input.value = slider.value;
+      if (!autoSyncEnabled) return;
+      if (sliderSendMode === 'live') throttleSend(name, slider.value);
+      else updateAckBadge(name, 'ack-pending', `松手后发送: ${slider.value}`, true);
+    });
+    // change: 松开鼠标 / 触摸结束 / 键盘方向键每步
+    slider.addEventListener('change', () => {
+      input.value = slider.value;
+      if (!autoSyncEnabled) return;
+      if (sliderSendMode === 'release') {
+        cancelSliderSend(name);
+        sendParamUpdate(name, slider.value);
+      } else {
+        flushSliderSend(name, slider.value, true);
+      }
+    });
+    // 数字框回车 / 失焦: 总是立即下发
+    input.addEventListener('change', () => {
+      slider.value = input.value;
+      cancelSliderSend(name);
+      sendParamUpdate(name, input.value);
+    });
+  }
 
   function setupParamBindings() {
     const bindList = [
@@ -434,24 +549,12 @@
       const btnSend = document.querySelector(`.btn-send[data-target="${item.id}"]`);
 
       if (!slider || !input) return;
-
-      // 滑动条拖动同步
-      slider.addEventListener('input', (e) => {
-        input.value = e.target.value;
-        if (autoSyncEnabled) {
-          debounceSend(item.id, e.target.value);
-        }
-      });
-
-      // 数字输入框修改
-      input.addEventListener('change', (e) => {
-        slider.value = e.target.value;
-        sendParamUpdate(item.id, e.target.value);
-      });
+      bindParamSlider(item.id, slider, input);
 
       // 发送按钮点击
       if (btnSend) {
         btnSend.addEventListener('click', () => {
+          cancelSliderSend(item.id);
           sendParamUpdate(item.id, input.value);
         });
       }
@@ -473,8 +576,13 @@
           } else {
             next = Math.round(next * 100) / 100;
           }
+          // v3.1: 按滑动条范围钳位 (旧实现滑动条被浏览器钳位, 但数字框与下发值越界, 固件回 OUT_OF_RANGE)
+          const lo = parseFloat(slider.min), hi = parseFloat(slider.max);
+          if (Number.isFinite(lo)) next = Math.max(lo, next);
+          if (Number.isFinite(hi)) next = Math.min(hi, next);
           input.value = next;
           slider.value = next;
+          cancelSliderSend(target);
           sendParamUpdate(target, next);
         }
       });
@@ -490,13 +598,6 @@
     if (slider && document.activeElement !== slider) {
       slider.value = valStr;
     }
-  }
-
-  function debounceSend(paramName, value) {
-    clearTimeout(debounceTimers[paramName]);
-    debounceTimers[paramName] = setTimeout(() => {
-      sendParamUpdate(paramName, value);
-    }, 40); // 40ms 防抖
   }
 
   function sendParamUpdate(paramName, value) {
@@ -588,56 +689,84 @@
     renderDynamicParams();
   }
 
+  // v3.1 安全修复: 旧实现用 innerHTML 拼接固件上报的 name/min/max/val, 且每收到一条 param_meta 就整体重建
+  // (N 个参数 → O(N²) 次 DOM 重建, 正在拖动的动态滑动条会被打断)。改为 textContent 构建 + 按参数名增量更新。
+  const dynamicRows = new Map();   // name -> { row, slider, input, badge }
+  const DYNAMIC_KNOWN_KEYS = ['pid_kp', 'pid_ki', 'pid_kd', 'target_speed', 'max_current', 'work_mode', 'motor_en'];
+
   function renderDynamicParams() {
-    const knownKeys = ['pid_kp', 'pid_ki', 'pid_kd', 'target_speed', 'max_current', 'work_mode', 'motor_en'];
     const unknowns = [];
     dynamicParams.forEach((meta, name) => {
-      if (!knownKeys.includes(name)) {
-        unknowns.push(meta);
-      }
+      if (!DYNAMIC_KNOWN_KEYS.includes(name)) unknowns.push(meta);
     });
 
     if (unknowns.length === 0) {
-      els.dynamicContainer.innerHTML = '<div class="empty-hint">所有注册参数均已在上方专属控制面板中显示。</div>';
+      if (!dynamicRows.size) {
+        els.dynamicContainer.textContent = '';
+        const hint = document.createElement('div');
+        hint.className = 'empty-hint';
+        hint.textContent = '所有注册参数均已在上方专属控制面板中显示。';
+        els.dynamicContainer.appendChild(hint);
+      }
       return;
     }
-
-    els.dynamicContainer.innerHTML = '';
+    if (!dynamicRows.size) els.dynamicContainer.textContent = '';
     unknowns.forEach(meta => {
-      const row = document.createElement('div');
-      row.className = 'param-row';
-      row.innerHTML = `
-        <div class="param-info">
-          <span class="param-name">${meta.name}</span>
-          <span class="param-tag">Type ${meta.type_code} [${meta.min}..${meta.max}]</span>
-          <span class="param-ack-badge" id="ack-${meta.name}">已同步: ${meta.val}</span>
-        </div>
-        <div class="param-control">
-          <input type="range" class="range-slider" id="slider-${meta.name}" min="${meta.min}" max="${meta.max}" step="${meta.type_code === 0 ? '0.01' : '1'}" value="${meta.val}">
-          <div class="num-box-group">
-            <input type="number" class="num-input" id="input-${meta.name}" value="${meta.val}">
-            <button class="btn btn-xs btn-send" id="btn-send-${meta.name}">发送</button>
-          </div>
-        </div>
-      `;
-      els.dynamicContainer.appendChild(row);
-
-      const sl = row.querySelector(`#slider-${meta.name}`);
-      const inp = row.querySelector(`#input-${meta.name}`);
-      const btn = row.querySelector(`#btn-send-${meta.name}`);
-
-      sl.addEventListener('input', (e) => {
-        inp.value = e.target.value;
-        if (autoSyncEnabled) debounceSend(meta.name, e.target.value);
-      });
-      inp.addEventListener('change', (e) => {
-        sl.value = e.target.value;
-        sendParamUpdate(meta.name, e.target.value);
-      });
-      btn.addEventListener('click', () => {
-        sendParamUpdate(meta.name, inp.value);
-      });
+      const ref = dynamicRows.get(meta.name);
+      if (ref) updateDynamicRow(ref, meta);
+      else {
+        const created = createDynamicRow(meta);
+        dynamicRows.set(meta.name, created);
+        els.dynamicContainer.appendChild(created.row);
+      }
     });
+  }
+
+  function createDynamicRow(meta) {
+    const mk = (tag, cls, text) => {
+      const el = document.createElement(tag);
+      if (cls) el.className = cls;
+      if (text !== undefined) el.textContent = text;
+      return el;
+    };
+    const name = String(meta.name);
+    const row = mk('div', 'param-row');
+    const info = mk('div', 'param-info');
+    const tag = mk('span', 'param-tag');
+    const badge = mk('span', 'param-ack-badge', `已同步: ${meta.val}`);
+    badge.id = `ack-${name}`;
+    info.append(mk('span', 'param-name', name), tag, badge);
+    const control = mk('div', 'param-control');
+    const slider = mk('input', 'range-slider');
+    slider.type = 'range';
+    slider.id = `slider-${name}`;
+    slider.step = meta.type_code === 0 ? '0.01' : '1';
+    const group = mk('div', 'num-box-group');
+    const input = mk('input', 'num-input');
+    input.type = 'number';
+    input.id = `input-${name}`;
+    const btn = mk('button', 'btn btn-xs btn-send', '发送');
+    group.append(input, btn);
+    control.append(slider, group);
+    row.append(info, control);
+    const ref = { row, slider, input, badge, tag };
+    updateDynamicRow(ref, meta);
+    bindParamSlider(name, slider, input);
+    btn.addEventListener('click', () => {
+      cancelSliderSend(name);
+      sendParamUpdate(name, input.value);
+    });
+    return ref;
+  }
+
+  function updateDynamicRow(ref, meta) {
+    const num = v => (Number.isFinite(Number(v)) ? String(Number(v)) : '');
+    ref.tag.textContent = `Type ${meta.type_code} [${meta.min}..${meta.max}]`;
+    if (num(meta.min) !== '') ref.slider.min = num(meta.min);
+    if (num(meta.max) !== '') ref.slider.max = num(meta.max);
+    // 用户正在拖动 / 输入时不覆盖其操作
+    if (document.activeElement !== ref.slider) ref.slider.value = num(meta.val);
+    if (document.activeElement !== ref.input) ref.input.value = num(meta.val);
   }
 
   // ================= 实时波形绘制 =================
@@ -997,7 +1126,7 @@
       ctx.clearRect(0, 0, w, h);
 
       // 绘制背景网格
-      ctx.strokeStyle = '#1e2430';
+      ctx.strokeStyle = canvasTheme.grid;
       ctx.lineWidth = 1;
       for (let y = 30; y < h; y += 35) {
         ctx.beginPath();
@@ -1022,7 +1151,7 @@
       }
 
       // 绘制 Target 曲线 (蓝色虚线)
-      ctx.strokeStyle = '#58a6ff';
+      ctx.strokeStyle = canvasTheme.target;
       ctx.lineWidth = 2;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
@@ -1035,7 +1164,7 @@
       ctx.stroke();
 
       // 绘制 Actual 曲线 (绿色实线)
-      ctx.strokeStyle = '#3fb950';
+      ctx.strokeStyle = canvasTheme.actual;
       ctx.lineWidth = 2.5;
       ctx.setLineDash([]);
       ctx.beginPath();
@@ -1247,7 +1376,25 @@
     bindWaveInteractions();
     applyWaveWide();
     updateWaveModeUi();
+    applyWaveTheme();
+    if (typeof window !== 'undefined' && window.RTTTheme && typeof window.RTTTheme.onChange === 'function') {
+      window.RTTTheme.onChange(applyWaveTheme);
+    }
     requestAnimationFrame(drawWave);
+  }
+
+  /** v3.1: 主题切换 → 通道配色 + 画布配色, 并强制重绘三层画布与概览条 */
+  function applyWaveTheme() {
+    const T = typeof window !== 'undefined' ? window.RTTTheme : null;
+    if (!T || !WC) return;
+    const pal = T.palette();
+    for (let k = 0; k < WAVE_COLORS.length; k++) WAVE_COLORS[k] = pal[k % pal.length];
+    WC.setTheme(T.canvas());
+    if (wave.nch) rebuildWaveLegend();
+    wave.gridSig = '';
+    wave.ovLast = 0;
+    markDirty();
+    if (wave.settingsOpen) buildWaveSettingsPanel();
   }
 
   function measureStage() {
@@ -1693,15 +1840,17 @@
     if (cssW === wave.cssW && cssH === wave.cssH && dpr === wave.dpr) return false;
     wave.cssW = cssW; wave.cssH = cssH; wave.dpr = dpr;
     if (wave.stage && wave.stage.style) wave.stage.style.height = `${cssH}px`;
-    const fit = (layer, h) => {
+    const fit = (layer, h, fluid) => {
       if (!layer) return;
       layer.canvas.width = Math.round(cssW * dpr);
       layer.canvas.height = Math.round(h * dpr);
-      if (layer.canvas.style) { layer.canvas.style.width = `${cssW}px`; layer.canvas.style.height = `${h}px`; }
+      // 概览条在文档流中: 宽度保持 CSS 100%, 不能写死像素, 否则会把栅格列撑大 (点 "全宽" 再 "还原" 后
+      // 左栏被挤窄、页面出现横向滚动条), 窗口缩小时也无法回缩。三层画布为绝对定位, 不参与布局, 可用像素宽度。
+      if (layer.canvas.style) { layer.canvas.style.width = fluid ? '100%' : `${cssW}px`; layer.canvas.style.height = `${h}px`; }
       if (layer.ctx.setTransform) layer.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     fit(L.grid, cssH); fit(L.trace, cssH); fit(L.overlay, cssH);
-    fit(wave.overview, WAVE_OVERVIEW_H);
+    fit(wave.overview, WAVE_OVERVIEW_H, true);
     wave.gridSig = '';
     wave.ovLast = 0;
     wave.dirty = true;

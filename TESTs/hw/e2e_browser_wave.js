@@ -115,6 +115,8 @@ async function main() {
     for (let k = 0; k < 100 && !events.some(e => e.method === 'Page.loadEventFired'); k++) await sleep(50);
     await sleep(800);
     check('page loaded, wave core + controller present', await ev(`!!(window.RTTWaveCore && window.RTTApp && window.RTTApp.wave)`));
+    const lay0 = await ev(`({sw: document.documentElement.scrollWidth, iw: innerWidth})`);
+    check('layout: no horizontal overflow on load', lay0.sw <= lay0.iw + 1, lay0);
     if (MODE === 'lan') {
       check(`LAN client (${HOST}) defaults to binary + min/max decimation`, await S(`w.sub && w.sub.mode === 'decim' && w.sub.lan === true`), await S('w.sub'));
       await ev(`document.getElementById('conn-mode').value='mock'; document.getElementById('conn-mode').dispatchEvent(new Event('change')); document.getElementById('btn-connect').click();`);
@@ -154,7 +156,7 @@ async function main() {
     const st = await S(`({count:w.store&&w.store.count, nch:w.nch, fps:w.fps, rate:w.displayRate, decim:w.decim, frames:w.perf.frames, grid:w.perf.gridDraws, p95:w.perf.p95, ms:w.perf.ms, cap:w.store&&w.store.cap, sub:w.sub&&w.sub.mode})`);
     console.log('   state:', JSON.stringify(st));
     if (MODE === 'mock') check('mock: ~500 fps x 3 ch received as binary, no decimation', st.nch === 3 && st.fps > 350 && st.fps < 650 && st.decim === 1 && st.count > 1000, st);
-    else check('hardware: Ch1 JustFloat streaming (100-2000 fps), no decimation', st.nch >= 1 && st.fps > 100 && st.fps < 2000 && st.decim === 1 && st.count > 200, st);
+    else check('hardware: Ch1 JustFloat streaming (wave_div 1~50 -> ~5~5000 fps), no decimation', st.nch >= 1 && st.fps > 5 && st.fps < 5000 && st.decim === 1 && st.count > 20, st);
     check('grid layer redrawn rarely (stable axis)', st.grid <= Math.max(6, st.frames * 0.2), st);
     check('render p95 < 8 ms (main thread is sufficient)', st.p95 < 8, st.p95);
     check('capacity planned for 60 s at measured rate', Math.abs(st.cap - Math.ceil(60 * st.rate * 1.15)) / st.cap < 0.25 || st.cap === 1024, st);
@@ -233,14 +235,18 @@ async function main() {
       check('firmware wave_div parameter detected', detected, panel.slice(0, 300));
       if (detected) {
         const div0 = Number(await ev(`(()=>{const i=[...document.querySelectorAll('#wave-settings input')].find(e=>e.title.includes('wave_div'));return i?i.value:'2'})()`)) || 2;
+        const divMax = Number(await ev(`(()=>{const i=[...document.querySelectorAll('#wave-settings input')].find(e=>e.title.includes('wave_div'));return i?i.max:'50'})()`)) || 50;
+        // 在固件允许范围内翻倍或减半 (用户当前值可能已接近上限)
+        const div1 = div0 * 2 <= divMax ? div0 * 2 : Math.max(1, Math.floor(div0 / 2));
         const fps0 = await S('w.fps');
-        await ev(`window.RTTApp.sendRtt('$SET:wave_div=${div0 * 2}')`);
-        await sleep(5000);
+        await ev(`window.RTTApp.sendRtt('$SET:wave_div=${div1}')`);
+        await sleep(Math.max(5000, 4000 + 3 * 1000 * div1 / Math.max(1, fps0 * div0)));
         const fps1 = await S('w.fps');
         const seg = await S(`w.axis.segs.length`);
-        check(`wave_div ${div0} -> ${div0 * 2}: frame rate halves and time axis adds a segment`, fps1 < fps0 * 0.65 && fps1 > fps0 * 0.35 && seg >= 2, [fps0, fps1, seg]);
+        const expect = div0 / div1;
+        check(`wave_div ${div0} -> ${div1}: frame rate x${expect.toFixed(2)} and time axis adds a segment`, Math.abs(fps1 / fps0 - expect) / expect < 0.3 && seg >= 2, [fps0, fps1, seg]);
         const win = await S(`w.axis.timeOf(w.lastView.i1) - w.axis.timeOf(w.lastView.i0)`);
-        check('time window stays 2 s after rate change', Math.abs(win - 2) < 0.15, win);
+        check('time window stays 2 s after rate change', Math.abs(win - 2) < 0.15 + 2 / Math.max(1, fps1), win);
         await ev(`window.RTTApp.sendRtt('$SET:wave_div=${div0}')`);
         await sleep(4000);
         const fps2 = await S('w.fps');
@@ -250,6 +256,8 @@ async function main() {
     await ev(`document.getElementById('btn-wave-settings').click()`);
 
     // ---------------------------------------------------------- ACK markers
+    // 真机上测试结束必须把 pid_kp 恢复为测试前的值 (测试前由 $GET:ALL 同步到输入框)
+    const kp0 = await ev(`document.getElementById('input-pid_kp').value`);
     await ev(`window.RTTApp.sendRtt('$SET:pid_kp=1.5')`);
     await sleep(500);
     await ev(`window.RTTApp.sendRtt('$SET:pid_kp=3.25')`);
@@ -257,8 +265,8 @@ async function main() {
     const mk = await S(`w.markers.map(m=>m.text)`);
     check('parameter change marker drawn on time axis', mk.some(t => /pid_kp: .*→3\.25/.test(t)), mk);
     await shot('5_marker');
-    await ev(`window.RTTApp.sendRtt('$SET:pid_kp=1.5')`);
-    await sleep(300);
+    await ev(`window.RTTApp.sendRtt('$SET:pid_kp=${Number(kp0) || 1.5}')`);
+    await sleep(500);
 
     // ---------------------------------------------------------- clear + full-width + perf summary
     await ev(`document.getElementById('btn-wave-clear').click()`);
@@ -270,8 +278,83 @@ async function main() {
     check('full-width mode spans both columns', await ev(`document.getElementById('wave-card').classList.contains('wave-wide') && document.getElementById('wave-card').getBoundingClientRect().width > 1200`));
     await shot('6_wide');
     await ev(`document.getElementById('btn-wave-wide').click()`);
+    await sleep(800);
+    const lay = await ev(`(()=>{const l=document.querySelector('.panels-left').getBoundingClientRect().width, r=document.querySelector('.panels-right').getBoundingClientRect().width;
+      return {sw: document.documentElement.scrollWidth, iw: innerWidth, ratio: l / r};})()`);
+    check('layout: no horizontal overflow after 全宽 -> 还原, columns keep ~1.15:0.85', lay.sw <= lay.iw + 1 && lay.ratio > 1.1 && lay.ratio < 1.6, lay);
+    await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 1400, deviceScaleFactor: 1, mobile: false });
+    await sleep(800);
+    const lay2 = await ev(`({sw: document.documentElement.scrollWidth, iw: innerWidth, stage: document.getElementById('waveStage').getBoundingClientRect().width, card: document.getElementById('wave-card').getBoundingClientRect().width})`);
+    check('layout: window shrink -> wave card shrinks with it (no overflow)', lay2.sw <= lay2.iw + 1 && lay2.stage <= lay2.card, lay2);
+    await send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1400, deviceScaleFactor: 1, mobile: false });
+    await sleep(500);
     const perf = await S(`({p95:w.perf.p95, frames:w.perf.frames, grid:w.perf.gridDraws, verts:w.perf.vertices})`);
     console.log('   perf:', JSON.stringify(perf));
+
+    // ---------------------------------------------------------- v3.1: slider send modes with real mouse drags
+    // 只在仿真模式运行: 真机上拖动会改变板子的实际参数
+    if (MODE === 'mock') {
+      const txCount = () => ev(`[...document.querySelectorAll('#terminal-output .log-line.tx')].filter(e=>e.textContent.includes('$SET:pid_kp=')).length`);
+      const sliderDrag = async (fromFrac, toFrac, beforeRelease) => {
+        await ev(`document.getElementById('slider-pid_kp').scrollIntoView({block:'center'})`);
+        await sleep(200);
+        const b = await ev(`(()=>{const r=document.getElementById('slider-pid_kp').getBoundingClientRect();return {x:r.left,y:r.top+r.height/2,w:r.width}})()`);
+        const x0 = b.x + b.w * fromFrac, x1 = b.x + b.w * toFrac;
+        await mouse('mouseMoved', x0, b.y);
+        await mouse('mousePressed', x0, b.y, { button: 'left', buttons: 1, clickCount: 1 });
+        for (let k = 1; k <= 12; k++) { await mouse('mouseMoved', x0 + (x1 - x0) * k / 12, b.y, { button: 'left', buttons: 1 }); await sleep(16); }
+        await sleep(300);
+        const mid = beforeRelease ? await beforeRelease() : null;
+        await mouse('mouseReleased', x1, b.y, { button: 'left', buttons: 0, clickCount: 1 });
+        await sleep(500);
+        return mid;
+      };
+      check('slider mode toggle defaults to "拖动即发"', await ev(`document.querySelector('#slider-send-mode .seg-btn[data-mode="live"]').classList.contains('active')`));
+      let c0 = await txCount();
+      await sliderDrag(0.2, 0.6);
+      const liveSends = (await txCount()) - c0;
+      check(`live mode: real drag sends several updates while moving (${liveSends})`, liveSends >= 3, liveSends);
+      await ev(`document.querySelector('#slider-send-mode .seg-btn[data-mode="release"]').click()`);
+      c0 = await txCount();
+      const midCount = await sliderDrag(0.6, 0.3, async () => ({ n: (await txCount()) - c0, badge: await ev(`document.getElementById('ack-pid_kp').textContent`) }));
+      const relSends = (await txCount()) - c0;
+      check('release mode: nothing sent while dragging, badge previews value', midCount.n === 0 && /松手后发送/.test(midCount.badge), midCount);
+      check(`release mode: exactly one update after mouse release (${relSends})`, relSends === 1, relSends);
+      const finalVal = await ev(`document.getElementById('input-pid_kp').value`);
+      const lastTx = await ev(`[...document.querySelectorAll('#terminal-output .log-line.tx')].map(e=>e.textContent).filter(t=>t.includes('$SET:pid_kp=')).pop()`);
+      // 数字框会被固件 ACK 回填为 "14.3100" 之类的格式, 按数值比较
+      const sentVal = Number((/\$SET:pid_kp=([-0-9.eE]+)/.exec(lastTx) || [])[1]);
+      check('release mode: sent value equals the final slider value', Math.abs(sentVal - Number(finalVal)) < 1e-6, [lastTx, finalVal]);
+      check('release mode persisted', await ev(`localStorage.getItem('sliderSendMode') === 'release'`));
+      await ev(`document.querySelector('#slider-send-mode .seg-btn[data-mode="live"]').click()`);
+    }
+
+    // ---------------------------------------------------------- v3.1: light theme
+    {
+      const fullShot = async name => {
+        await ev(`window.scrollTo(0,0)`);
+        await sleep(300);
+        const dim = await ev(`({w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight})`);
+        const img = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true, clip: { x: 0, y: 0, width: dim.w, height: Math.min(dim.h, 2600), scale: 0.75 } });
+        const f = path.join(SHOTS, `${MODE}_${name}.png`);
+        fs.writeFileSync(f, Buffer.from(img.data, 'base64'));
+        console.log(`   screenshot: ${f}`);
+      };
+      await fullShot('7_full_dark');
+      await ev(`document.getElementById('btn-theme').click()`);
+      await sleep(600);
+      const th = await ev(`({t: document.documentElement.dataset.theme, bg: getComputedStyle(document.body).backgroundColor, card: getComputedStyle(document.querySelector('.card')).backgroundColor, txt: getComputedStyle(document.body).color, btn: document.getElementById('btn-theme').textContent, saved: localStorage.getItem('uiTheme')})`);
+      check('theme toggle -> light: page background / card / text colors switch', th.t === 'light' && th.bg === 'rgb(243, 245, 248)' && th.card === 'rgb(255, 255, 255)' && th.txt === 'rgb(31, 35, 40)' && th.saved === 'light', th);
+      check('Ch1 canvas uses light palette after toggle', await ev(`window.RTTWaveCore.THEME.grid === window.RTTTheme.canvas('light').grid`));
+      const px = await ev(`(()=>{const c=document.getElementById('waveOverview'); const d=c.getContext('2d').getImageData(2, 2, 1, 1).data; return [d[0],d[1],d[2]];})()`);
+      check('overview bar repainted light (pixel sample)', px[0] > 200 && px[1] > 200 && px[2] > 200, px);
+      await fullShot('8_full_light');
+      await shot('9_wave_light');
+      await ev(`location.reload()`);
+      await sleep(1500);
+      check('light theme survives reload (applied before first paint)', await ev(`document.documentElement.dataset.theme === 'light'`));
+      await ev(`document.getElementById('btn-theme').click()`);
+    }
     check('no JS exceptions / console errors in page', errors.length === 0, errors.slice(0, 5));
 
     await ev(`window.RTTApp.sendJson({type:'disconnect'})`);

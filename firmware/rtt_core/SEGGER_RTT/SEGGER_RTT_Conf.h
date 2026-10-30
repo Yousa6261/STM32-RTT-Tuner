@@ -42,7 +42,7 @@
  * 由 64 提高到 96：$ACK:PARAM 应答在参数名较长时可能超过 63 字节。
  */
 #ifndef SEGGER_RTT_PRINTF_BUFFER_SIZE
-  #define SEGGER_RTT_PRINTF_BUFFER_SIZE           (96u)
+  #define SEGGER_RTT_PRINTF_BUFFER_SIZE           (128u)   /* v3.2: 96 -> 128, 变量名较长时 $ACK:PARAM 不再被整行丢弃 */
 #endif
 
 #define SEGGER_RTT_MODE_DEFAULT                   SEGGER_RTT_MODE_NO_BLOCK_SKIP

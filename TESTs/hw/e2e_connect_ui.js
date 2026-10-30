@@ -81,6 +81,10 @@ async function main() {
     const fps1 = await ev(`window.RTTApp.wave.state.fps`);
     check('Ch1 streaming through the gateway (~100 fps from fake OpenOCD)', fps1 > 60 && fps1 < 160, fps1);
 
+    // ---------------------------------------------------------------- 2b) silent firmware (fake OpenOCD never answers $GET:ALL) -> explicit warning, not a silent empty list
+    check('no $GET:ALL answer -> parameter badge turns into a visible warning', await waitFor(`document.getElementById('dynamic-param-count').classList.contains('count-warn')`, 6000), await ev(`document.getElementById('dynamic-param-count').textContent`));
+    check('warning text in the terminal explains RTT_Param_Poll / registering variables', /RTT_Param_Poll/.test(await ev(`document.getElementById('terminal-output').innerText`)));
+
     // ---------------------------------------------------------------- 3) overlay Y axis default = shared true amplitude
     await sleep(500);
     const ax = await ev(`(() => { const w = window.RTTApp.wave.state; const p = w.plots[0]; return { n: w.plots.length, axis: p && p.axis, same: p && [0,1,2].every(c => p.ranges[c] === p.axis), mode: w.settings.layout }; })()`);

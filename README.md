@@ -43,6 +43,13 @@ python host\server\run.py
 
 **波形纵轴**：叠加显示默认**共用一个纵轴、按真实幅值比例**显示（与 VOFA+ 一致）；幅值悬殊时用「分图」布局看各自细节，或在设置里把某图改为「各自归一化铺满」（仅看形状，幅值比例不真实）。
 
+## 网页看不到我注册的变量？
+
+1. 终端里看 `[ACK 收到]`/`参数列表同步完成 (共 N 个)` 或红色告警：参数徽标显示 `已同步 M/N 项 ⚠` 说明列表不完整。
+2. **用本仓库 `firmware/rtt_core/` 里的 `rtt_param_parser.c/.h`、`SEGGER_RTT/SEGGER_RTT_Conf.h` 覆盖你工程里的旧版并重新编译烧录**（v3.2 起 `$GET:ALL` 分批输出，旧版注册约 15~20 个以上变量就会溢出 Ch0 缓冲而丢失，`RTT_Send_Telemetry` 超长也会被丢）。
+3. 告警写"固件没有响应 `$GET:ALL`"：检查固件是否调用了 `RTT_Param_Init()`，主循环里是否持续调用 `RTT_Param_Poll()`，变量是否用 `RTT_REGISTER_FLOAT/INT/UINT/BOOL` 注册。
+4. 名字与内置控件同名 (`pid_kp`/`pid_ki`/`pid_kd`/`target_speed`/`max_current`/`work_mode`/`motor_en`) 的变量显示在上方专属面板，其余显示在「单片机动态自注册参数表」。
+
 ## 运行自动化测试
 
 ```bat

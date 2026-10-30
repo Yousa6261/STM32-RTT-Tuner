@@ -633,6 +633,8 @@ class RTTManager:
         self.rx_task: Optional[asyncio.Task] = None
         self.telemetry_task: Optional[asyncio.Task] = None
         self.pending_sends: Dict[str, float] = {}
+        self._plist = None                   # 最近一次 $GET:ALL 的接收进度 (参数列表完整性检查)
+        self._plist_retrying = False
         self.reused = False                  # 本次连接复用了已运行的 OpenOCD (19021)
         self.user_disconnected = False       # 用户在网页上主动断开过: 此后不再因 VOFA+ 接入而自动重连
         self.status_extra = None             # AppServer 注入: () -> dict (VOFA+ 客户端数等)
@@ -1202,6 +1204,8 @@ class RTTManager:
             self.pending_sends[param_key] = t_now
         elif line.startswith("$PING"):
             self.pending_sends["$PING"] = t_now
+        elif line.strip() == "$GET:ALL":
+            self._plist_begin()
 
         # 广播发送日志给前端
         await self.broadcast({
@@ -1338,8 +1342,12 @@ class RTTManager:
             if len(parts) >= 4 and "=" in parts[0]:
                 k, v = parts[0].split("=", 1)
                 ptype = int(parts[1])
-                min_v = float(parts[2])
-                max_v = float(parts[3])
+                # 固件把 INFINITY / NaN 打印成 inf / nan; json.dumps 会输出 Infinity/NaN (非法 JSON), 浏览器 JSON.parse 抛错,
+                # 整条 param_meta 被丢弃 → 该变量在网页上"凭空消失"。钳位为 float32 最大有限值。
+                min_v = self._finite_range(float(parts[2]), -3.4028235e38)
+                max_v = self._finite_range(float(parts[3]), 3.4028235e38)
+                if self._plist is not None:
+                    self._plist["names"].add(k)
                 await self.broadcast({
                     "type": "param_meta",
                     "name": k,
@@ -1350,10 +1358,17 @@ class RTTManager:
                 })
 
         elif line_clean.startswith("$ACK:PARAM_LIST_END:"):
+            try:
+                expected = int(line_clean.split(":")[2])
+            except (IndexError, ValueError):
+                expected = None
+            got = len(self._plist["names"]) if self._plist is not None else None
             await self.broadcast({
                 "type": "param_list_sync_done",
-                "count": line_clean.split(":")[2] if len(line_clean.split(":")) > 2 else 0
+                "count": expected if expected is not None else 0,
+                "received": got
             })
+            await self._plist_check(expected)
 
         elif line_clean.startswith("$ACK:PONG"):
             latency = None
@@ -1373,6 +1388,59 @@ class RTTManager:
                 "error_msg": line_clean[9:],
                 "timestamp": t_now
             })
+
+    @staticmethod
+    def _finite_range(v: float, fallback: float) -> float:
+        return v if math.isfinite(v) else fallback
+
+    # ---- $GET:ALL 完整性检查 ----
+    # 旧固件一次性输出全部 $ACK:PARAM, 超过 Ch0 上行缓冲 (1 KB) 的行会被固件静默丢弃, 网页只显示前几个变量且毫无提示。
+    # 这里把"固件声明的数量"与"实际收到的数量"对比, 不一致时重试一次并明确告警。
+    PLIST_WATCHDOG_S = 3.0
+
+    def _plist_begin(self):
+        # 内部重试发出的 $GET:ALL 标记为 retried, 用户手动刷新则重新计数
+        retried = self._plist_retrying
+        self._plist_retrying = False
+        self._plist = {"names": set(), "expected": None, "retried": retried, "warned": False, "token": time.monotonic()}
+        asyncio.get_running_loop().create_task(self._plist_watchdog(self._plist["token"]))
+
+    async def _plist_watchdog(self, token: float):
+        await asyncio.sleep(self.PLIST_WATCHDOG_S)
+        pl = self._plist
+        if pl is None or pl["token"] != token or pl["expected"] is not None or pl["warned"] or not self.connected:
+            return
+        # 3 秒内没有收到 PARAM_LIST_END: 要么行被丢 (缓冲溢出), 要么固件没有集成调参模块
+        await self._plist_warn(len(pl["names"]), None)
+
+    async def _plist_check(self, expected):
+        pl = self._plist
+        if pl is None or expected is None:
+            return
+        pl["expected"] = expected
+        got = len(pl["names"])
+        if got >= expected:
+            pl["retried"] = False
+            return
+        if not pl["retried"] and self.connected:
+            await asyncio.sleep(0.6)
+            self._plist_retrying = True
+            await self.send_rtt("$GET:ALL\n")      # 重试一次 (已收到的变量保留在网页端)
+            return
+        await self._plist_warn(got, expected)
+
+    async def _plist_warn(self, got: int, expected):
+        pl = self._plist
+        if pl is not None:
+            pl["warned"] = True
+        if expected is None and got == 0:
+            msg = ("固件没有响应 $GET:ALL: 请确认固件已调用 RTT_Param_Init() / RTT_Param_Poll() (主循环里要持续调用), "
+                   "且变量已用 RTT_REGISTER_xxx 注册")
+        else:
+            exp = f"固件声明 {expected} 个" if expected is not None else "未收到列表结束标记"
+            msg = (f"变量列表不完整: {exp}, 网页只收到 {got} 个。原因通常是 Ch0 上行缓冲 (默认 1024 B) 装不下一次性输出的全部变量行, "
+                   "溢出的行被固件丢弃。请更新固件 rtt_param_parser.c (v3.2 起分批输出), 或把 BUFFER_SIZE_UP 调大到 4096")
+        await self.broadcast({"type": "param_sync_warn", "received": got, "expected": expected, "message": msg})
 
     async def _mock_telemetry_loop(self):
         tick = 0

@@ -288,7 +288,22 @@
           break;
 
         case 'param_list_sync_done':
-          logTerminal('system', `✅ 参数列表同步完成 (共 ${msg.count} 个注册变量)`);
+          if (msg.received !== null && msg.received !== undefined && Number(msg.count) > msg.received) {
+            logTerminal('system', `⏳ 参数列表: 固件声明 ${msg.count} 个, 已收到 ${msg.received} 个, 正在重试...`);
+          } else {
+            logTerminal('system', `✅ 参数列表同步完成 (共 ${msg.count} 个注册变量)`);
+            if (els.dynamicCount) { els.dynamicCount.classList.remove('count-warn'); els.dynamicCount.title = ''; }
+          }
+          break;
+
+        case 'param_sync_warn':
+          // 变量列表不完整 (固件 Ch0 缓冲溢出丢行 / 固件未响应): 明确告警, 不再\"静默少几个变量\"
+          logTerminal('ack-err', `⚠️ ${msg.message}`);
+          if (els.dynamicCount) {
+            els.dynamicCount.textContent = `已同步 ${dynamicParams.size}${msg.expected ? '/' + msg.expected : ''} 项 ⚠`;
+            els.dynamicCount.title = msg.message;
+            els.dynamicCount.classList.add('count-warn');
+          }
           break;
 
         case 'telemetry':

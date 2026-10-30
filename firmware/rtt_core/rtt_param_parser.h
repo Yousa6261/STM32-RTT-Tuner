@@ -23,7 +23,7 @@ extern "C" {
 #define RTT_RX_BUFFER_SIZE      256
 
 /* 最大支持注册的参数数量 */
-#define RTT_MAX_PARAM_COUNT     32
+#define RTT_MAX_PARAM_COUNT     64   /* v3.2: 32 -> 64; 注册失败 (表满) 时 RTT_Param_Register 返回 false, 超出的变量不会出现在网页 */
 
 /* 参数数据类型枚举 */
 typedef enum {

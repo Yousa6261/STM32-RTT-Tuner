@@ -817,6 +817,40 @@ except (OSError, ValueError):
 
 ---
 
+## 2026-10-30 · 第 20 批（v3.2）：ST-Link 已连接但网页看不到已注册变量
+
+> 现象：用户用 ST-Link 已连接成功 (FIX-042 后实测 ST-Link V2.1 + STM32H7 自动识别、复用、Ch1 波形均正常)，但网页上看不到自己注册的变量。
+> 排查结论：与调试器无关，是**固件 Ch0 上行缓冲 (1 KB) 溢出丢行 + 个别数值格式导致整行/整条消息丢失**。
+> 用真实固件源码在主机上编译复现 (`TESTs/fw_host/` + gcc，模拟 OpenOCD 每 10 ms 最多取走 1 KB)：
+> 旧固件注册 21 / 31 个变量时只有 18 行到达且 `PARAM_LIST_END` 丢失；135 字符的遥测串整条被丢弃。
+
+### FIX-046 ✅ 🔴 `$GET:ALL` 一次性输出溢出 Ch0 缓冲，变量被静默丢弃 (`rtt_param_parser.c`)
+
+- **根因**：`process_command` 在一个循环里连续 `SEGGER_RTT_printf` 全部参数。Ch0 上行缓冲仅 `BUFFER_SIZE_UP` (1024 B)，每行 50~70 B，注册约 15~20 个以上变量即溢出；
+  `NO_BLOCK_SKIP` 模式下放不下的行被整行丢弃，主机端毫无提示。
+- **修复**：改为**分批应答**：收到 `$GET:ALL` 只记录起点，`RTT_Param_Poll()` 每轮在缓冲区剩余空间 ≥ 一行 (printf 缓冲 + 8 B) 时继续输出，
+  主机取走数据后接着发，永不溢出；范围值改用 `%.6g` 并把 INF/NaN 钳位为 ±float32 最大值；`|v| ≥ 1e9` 的数值也改用 `%g`；
+  行仍超长时退而发送"截短名字 + 无范围"的短行，至少让网页看到变量；`SEGGER_RTT_PRINTF_BUFFER_SIZE` 96 → 128；`RTT_MAX_PARAM_COUNT` 32 → 64。
+- **验证**：`python TESTs/test_fw_param_list.py`（需 gcc；编译真实固件源码）：11 / 21 / 32 个变量全部到达且有 `LIST_END`，最长行 73 B，线上无 inf/nan。
+
+### FIX-047 ✅ 🟡 超长 `RTT_Send_Telemetry` 整条被丢弃 (`rtt_param_parser.c`)
+
+- **根因**：`$DATA:` 整串一次 printf，超过 printf 缓冲 (95 B) 整条丢弃，变量一多网页看板什么都没有。
+- **修复**：超长时在逗号处拆成多条 `$DATA:` 行，网页按键名合并显示，不丢变量。
+- **验证**：135 字符遥测拆成 2 行 (126 + 16 B)，重新拼接与原串完全一致；旧固件同样输入输出 0 行。
+
+### FIX-048 ✅ 🟡 网关：INF/NaN 范围使整条 `param_meta` 被浏览器丢弃；列表不完整时静默 (`rtt_bridge.py`、`app.js`、`style.css`)
+
+- **根因**：旧固件把 `INFINITY` 范围打印成 `inf`；Python `float('inf')` → `json.dumps` 输出非法 JSON `Infinity`，浏览器 `JSON.parse` 抛错，该变量凭空消失。
+  另外网页从不核对"固件声明的数量"与"实际收到的数量"。
+- **修复**：范围钳位为有限值；新增 `$GET:ALL` 完整性检查 —— 收到 `PARAM_LIST_END:N` 但变量数 < N 时**自动重试一次**，仍不全则广播 `param_sync_warn`；
+  3 秒内没有 `LIST_END` 也告警 (区分"固件未响应，请检查 RTT_Param_Init / RTT_Param_Poll / 注册"与"列表不完整")。网页参数徽标变红显示 `已同步 M/N 项 ⚠`，终端给出原因与处理办法。
+- **验证**：`TESTs/test_param_sync.py` 12 项；`e2e_connect_ui.js` 新增 2 项 (固件无应答时徽标告警 + 终端提示)。
+
+**⚠ 使用者须知**：固件侧修复在 `firmware/rtt_core/`。**用户自己工程里的 `rtt_param_parser.c/.h` 与 `SEGGER_RTT_Conf.h` 必须用本仓库版本覆盖并重新编译烧录**，否则只有网页侧的告警，变量仍会丢。
+
+---
+
 ## 修改记录模板（后续批次参照）
 
 ```markdown

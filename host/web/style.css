@@ -1537,3 +1537,10 @@ body {
 .card-actions { flex-wrap: wrap; }
 .toggle-text { white-space: nowrap; }
 .wave-container { min-width: 0; overflow: hidden; }
+
+/* 参数列表不完整告警 (固件 Ch0 缓冲溢出丢行) */
+.count-warn {
+  color: var(--accent-red, #f85149) !important;
+  border-color: var(--accent-red, #f85149) !important;
+  cursor: help;
+}

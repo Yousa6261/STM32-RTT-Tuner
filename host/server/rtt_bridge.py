@@ -64,6 +64,56 @@ def _is_port_open(host: str = "127.0.0.1", port: int = 19021, timeout: float = 0
     except OSError:
         return False
 
+def _list_usb_ids() -> list:
+    """枚举当前 USB 设备 [(PNPDeviceID, Name)] (仅 Windows)。较慢 (约 1~5 s), 须在线程中调用。"""
+    if os.name != "nt":
+        return []
+    ps = ("Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -like 'USB*' } | "
+          "ForEach-Object { $_.PNPDeviceID + '|' + $_.Name }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True,
+                             text=True, timeout=10, errors="replace").stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    devs = []
+    for line in out.splitlines():
+        if "|" in line:
+            pid, name = line.split("|", 1)
+            devs.append((pid.strip().upper(), name.strip()))
+    return devs
+
+
+def probe_kind_order(devs: list) -> tuple:
+    """按已插入的调试器给出尝试顺序: (顺序列表, 实际检测到的列表)。kind ∈ stlink / wch / cmsis。
+    ST-Link > WCH-Link > 其他 CMSIS-DAP; 未检测到的类型排在后面作为兜底。"""
+    ids = [d[0] for d in devs]
+    names = [d[1].upper() for d in devs]
+    found = []
+    if any(i.startswith("USB\\VID_0483") for i in ids):
+        found.append("stlink")
+    if any(i.startswith(("USB\\VID_1A86&PID_8012", "USB\\VID_1A86&PID_8011")) for i in ids):
+        found.append("wch")
+    if any(i.startswith("USB\\VID_0D28") for i in ids) or any("CMSIS-DAP" in n for n in names):
+        found.append("cmsis")
+    order = list(found)
+    for k in ("cmsis", "wch", "stlink") if not found else ("stlink", "cmsis", "wch"):
+        if k not in order:
+            order.append(k)
+    return order, found
+
+
+def _openocd_process_running() -> bool:
+    """系统中是否已有 openocd 进程 (如 一键启动全套 拉起的窗口仍在初始化, 此时 19021 尚未监听)"""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq openocd.exe", "/NH"], capture_output=True,
+                                 text=True, timeout=5, errors="replace").stdout
+            return "openocd.exe" in out.lower()
+        return subprocess.run(["pgrep", "-x", "openocd"], capture_output=True, timeout=3).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 # 连接参数校验 (v3 P0 安全修复): openocd_target / openocd_ram 会被拼进 OpenOCD 的 Tcl 命令 (-c "..."),
 # 未校验时可注入任意 Tcl 语句。只接受下列格式。
 RE_OCD_TARGET = re.compile(r"^[a-z0-9_]{2,32}$")
@@ -583,6 +633,10 @@ class RTTManager:
         self.rx_task: Optional[asyncio.Task] = None
         self.telemetry_task: Optional[asyncio.Task] = None
         self.pending_sends: Dict[str, float] = {}
+        self.reused = False                  # 本次连接复用了已运行的 OpenOCD (19021)
+        self.user_disconnected = False       # 用户在网页上主动断开过: 此后不再因 VOFA+ 接入而自动重连
+        self.status_extra = None             # AppServer 注入: () -> dict (VOFA+ 客户端数等)
+        self._ocd_stopped_at = 0.0           # 网关自己拉起的 OpenOCD 最近一次被关闭的时刻 (等待 USB 释放)
         # 2026-10-23: Ch1 (JustFloat) 波形接收任务 -> 网页波形; VOFA+ 直接连 OpenOCD 19022,
         # OpenOCD RTT 服务端口不限连接数且每个连接都收到完整数据 (src/server/rtt_server.c), 两者互不抢占
         self.ch1_task: Optional[asyncio.Task] = None
@@ -820,7 +874,15 @@ class RTTManager:
         return "0x40000"       # STM32H7 AXI SRAM (沿用原值; 控制块位于 RAM 头部即命中)
 
     def get_status(self) -> dict:
+        extra = {}
+        if callable(self.status_extra):
+            try:
+                extra = self.status_extra() or {}
+            except Exception:
+                extra = {}
         return {
+            **extra,
+            "reused": self.reused,
             "type": "status",
             "connected": self.connected,
             "mode": self.mode,
@@ -837,7 +899,7 @@ class RTTManager:
     def validate_connect_args(mode: str, speed, host: str, port, openocd_target: str, openocd_ram: str,
                               chip: Optional[str]) -> Optional[str]:
         """返回错误信息; 参数合法时返回 None"""
-        if mode not in ("mock", "telnet", "pylink", "stlink", "daplink"):
+        if mode not in ("mock", "telnet", "pylink", "stlink", "daplink", "auto"):
             return f"未知连接模式: {mode!r}"
         if not isinstance(speed, int) or not (50 <= speed <= 50000):
             return f"SWD 时钟超出范围 (50~50000 kHz): {speed!r}"
@@ -852,6 +914,26 @@ class RTTManager:
         if chip is not None and not RE_CHIP_ID.match(str(chip)):
             return f"芯片 id 格式不合法: {chip!r}"
         return None
+
+    async def _try_reuse_openocd(self, mode: str):
+        """19021 已有 OpenOCD 在监听 → 直接复用 (返回 (ok, msg)); 端口未监听返回 None。"""
+        if not _is_port_open("127.0.0.1", 19021, timeout=0.5):
+            return None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(3.0)
+            s.connect(("127.0.0.1", 19021))
+            s.setblocking(False)
+            self.socket = s
+            self.connected = True
+            self.reused = True
+            self.rx_task = asyncio.create_task(self._telnet_rx_loop())
+            self._start_ch1()
+            return True, ("检测到 19021 已有 OpenOCD RTT 服务 (一键启动脚本?), "
+                          "已自动复用现有连接 (避免双实例抢占调试器; 调试器类型以该 OpenOCD 窗口为准)")
+        except Exception as e:
+            return False, f"复用现有 OpenOCD 服务 (19021) 失败: {e}"
 
     async def connect(self, mode: str = "mock", target: str = "STM32H723VG", 
                       speed: int = 4000, host: str = "127.0.0.1", port: int = 19021,
@@ -913,52 +995,61 @@ class RTTManager:
                     self.jlink = None
                 return False, f"J-Link 直连失败: {str(e)}"
 
-        elif mode in ("stlink", "daplink"):
-            # 修复(C1) 防双开: 若 19021 已有外部 OpenOCD 在监听 (如一键启动全套.bat 拉起的
-            # 实例), 直接复用现有服务而非再启动一个 OpenOCD —— 双实例会争抢同一调试器的
-            # USB 句柄, 导致先启动的实例 SWD 总线冲突, 报 "cannot read IDR" 无限循环。
-            try:
-                _probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                _probe.settimeout(0.5)
-                _probe.connect(("127.0.0.1", 19021))
-                _probe.close()
-            except OSError:
-                pass  # 无现有服务, 走下方正常自启流程
-            else:
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    s.settimeout(3.0)
-                    s.connect(("127.0.0.1", 19021))
-                    s.setblocking(False)
-                    self.socket = s
-                    self.connected = True
-                    self.rx_task = asyncio.create_task(self._telnet_rx_loop())
-                    self._start_ch1()
-                    return True, ("检测到 19021 已有 OpenOCD RTT 服务 (一键启动脚本?), "
-                                  "已自动复用现有连接 (避免双实例抢占调试器)")
-                except Exception as e:
-                    return False, f"复用现有 OpenOCD 服务 (19021) 失败: {e}"
+        elif mode in ("stlink", "daplink", "auto"):
+            self.user_disconnected = False
+            # 1) 已有 OpenOCD (一键启动脚本 / 用户手动运行) 在监听 19021 → 直接复用 (避免双实例争抢调试器 USB)
+            reused = await self._try_reuse_openocd(mode)
+            if reused is not None:
+                return reused
 
+            # 2) 另一个 openocd 进程正在初始化 (一键启动全套: openocd_rtt.py 先做 USB 探测, 数秒内 19021 尚未监听)。
+            #    此前网关在这段时间里会再起一个 OpenOCD 抢同一个 ST-Link, 双方都读不到芯片 → "连不上"。改为等待它就绪。
+            if await asyncio.to_thread(_openocd_process_running):
+                t_wait = time.monotonic()
+                while time.monotonic() - t_wait < 25.0:
+                    reused = await self._try_reuse_openocd(mode)
+                    if reused is not None:
+                        return reused
+                    if not await asyncio.to_thread(_openocd_process_running):
+                        break
+                    await asyncio.sleep(0.5)
+
+            # 3) 自行启动 OpenOCD
+            iface_defs = {
+                "stlink": ("stlink", ["-f", "interface/stlink.cfg"]),
+                "cmsis": ("daplink", ["-f", "interface/cmsis-dap.cfg"]),
+                # WCH-Link (0x1a86:0x8012/8011) 的 CMSIS-DAP 模式
+                "wch": ("daplink", ["-f", "interface/cmsis-dap.cfg", "-c", "cmsis-dap vid_pid 0x1a86 0x8012 0x1a86 0x8011"]),
+            }
+            detected = []
             if mode == "stlink":
-                iface_candidates = [["-f", "interface/stlink.cfg"]]
-            else:
-                # daplink 模式下优先使用标准 cmsis-dap，若不匹配则自动回退尝试 WCH-Link (0x1a86:0x8012/8011)
-                iface_candidates = [
-                    ["-f", "interface/cmsis-dap.cfg"],
-                    ["-f", "interface/cmsis-dap.cfg", "-c", "cmsis-dap vid_pid 0x1a86 0x8012 0x1a86 0x8011"],
-                ]
+                kinds = ["stlink"]
+            elif mode == "daplink":
+                kinds = ["cmsis", "wch"]
+                detected = probe_kind_order(await asyncio.to_thread(_list_usb_ids))[1]
+            else:   # auto: 按实际插入的调试器排序依次尝试 (ST-Link > WCH > CMSIS-DAP)
+                kinds, detected = probe_kind_order(await asyncio.to_thread(_list_usb_ids))
 
             last_err_summary = "未知错误"
             last_err_msg = ""
-            for iface_args in iface_candidates:
+            resolved_mode = mode
+            for kind in kinds:
+                resolved_mode, iface_args = iface_defs[kind]
+                # ST-Link / 调试器刚被上一个 OpenOCD 释放时立即重开会 "open failed", 留出 USB 释放时间
+                gap = 1.0 - (time.monotonic() - self._ocd_stopped_at)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                # 自动识别时, 无线 CMSIS-DAP 实测 1MHz 稳定 (4MHz 会掉线); ST-Link 与显式选择则尊重用户设置
+                speed_khz = self.interface_speed
+                if mode == "auto" and resolved_mode == "daplink":
+                    speed_khz = min(speed_khz, 1000)
                 cmd = [
                     *find_openocd_cmd(),
                     *iface_args,
                     # 修复(B2a): stlink.cfg 不显式选择传输时默认 JTAG, SWD 接线必须显式声明
                     "-c", "transport select swd",
                     "-f", f"target/{self.openocd_target}.cfg",
-                    "-c", f"adapter speed {self.interface_speed}",
+                    "-c", f"adapter speed {speed_khz}",
                     "-c", "init",
                     # 修复(B2b): RTT 扫描范围按芯片系列自适应, 防止越过 SRAM 边界触发 Bus Fault
                     "-c", f"rtt setup {self.openocd_ram} {self._rtt_scan_size()} {{SEGGER RTT}}",
@@ -986,10 +1077,10 @@ class RTTManager:
                 except Exception as e:
                     return False, f"启动 OpenOCD 失败: {str(e)}"
 
-                # 动态轮询等待 OpenOCD 初始化 (最快 0.2s 即可响应，最慢等待 4.5s)
+                # 动态轮询等待 OpenOCD 初始化 (最快 0.2s 即可响应; ST-Link + H7 首次枚举较慢, 最多等 8s)
                 t_wait = time.monotonic()
                 port_ready = False
-                while time.monotonic() - t_wait < 4.5:
+                while time.monotonic() - t_wait < 8.0:
                     if self.openocd_proc.poll() is not None:
                         break
                     if _is_port_open("127.0.0.1", 19021, timeout=0.2):
@@ -1009,6 +1100,7 @@ class RTTManager:
                 except Exception:
                     pass
                 self.openocd_proc = None
+                self._ocd_stopped_at = time.monotonic()
                 last_err_msg = out.decode('utf-8', errors='replace').strip()
                 last_err_summary = last_err_msg.splitlines()[-1] if last_err_msg else "未知错误"
 
@@ -1018,8 +1110,21 @@ class RTTManager:
                 if "unable to find" in _low or "open failed" in _low:
                     hint = (" (常见原因: 调试器未插好或被占用 —— 请关闭 Keil 调试会话/其他 "
                             "OpenOCD 窗口, 拔插调试器后重试)")
+                names = {"stlink": "ST-Link", "wch": "WCH-Link", "cmsis": "DAP-Link"}
+                if not detected and os.name == "nt" and mode in ("auto", "daplink", "stlink"):
+                    hint += " 【未检测到 ST-Link / DAP-Link / WCH-Link 的 USB 设备: 请确认调试器已插好、目标板已上电 (无线 DAPLink 需先开机); 若 OpenOCD 窗口已能读到芯片, 说明调试器正被该窗口占用, 请直接点【连接目标】复用它】"
+                if detected:
+                    shown = " / ".join(names[k] for k in detected)
+                    hint += f" 【检测到的调试器: {shown}】"
+                    if mode == "daplink" and "stlink" in detected and "cmsis" not in detected:
+                        hint += " 当前选的是 DAP-Link 模式, 请改选 ST-Link 或\"自动识别\"模式"
+                    elif mode == "stlink" and "stlink" not in detected:
+                        hint += " 未检测到 ST-Link, 请改选\"自动识别\"模式"
                 await self.disconnect()
                 return False, f"OpenOCD 启动退出: {last_err_summary}{hint}"
+
+            if mode == "auto":
+                self.mode = resolved_mode   # 自动识别后记录实际使用的调试器类型, 状态栏显示 ST-Link / DAP-Link
 
             # 尝试连接 OpenOCD 开辟的 RTT 端口 (19021)
             try:
@@ -1032,7 +1137,7 @@ class RTTManager:
                 self.connected = True
                 self.rx_task = asyncio.create_task(self._telnet_rx_loop())
                 self._start_ch1()
-                return True, f"已通过 OpenOCD 成功连接 {mode.upper()} (目标: {self.openocd_target})"
+                return True, f"已通过 OpenOCD 成功连接 {self.mode.upper()} (目标: {self.openocd_target})"
             except Exception as e:
                 self.connected = False
                 await self.disconnect()
@@ -1070,6 +1175,7 @@ class RTTManager:
                 pass
             self.jlink = None
 
+        self.reused = False
         if self.openocd_proc:
             try:
                 self.openocd_proc.terminate()
@@ -1080,6 +1186,7 @@ class RTTManager:
                 except Exception:
                     pass
             self.openocd_proc = None
+            self._ocd_stopped_at = time.monotonic()
 
     async def send_rtt(self, line: str) -> bool:
         if not self.connected:
@@ -1333,6 +1440,25 @@ class AppServer:
         self.jf_clients: Set[asyncio.StreamWriter] = set()        # JustFloat 二进制客户端 (1347)
         self.rtt = RTTManager(self.broadcast, self.forward_ch1_frames)
         self.rtt.wave_sink = self.broadcast_wave
+        self.rtt.status_extra = self.vofa_status
+        self._autoconn_busy = False
+
+    def vofa_status(self) -> dict:
+        """VOFA+ 转发端口状态 (网页徽标显示端口与当前连接数, 用来确认\"转发\"是否真的生效)"""
+        return {"vofa": {"jf_port": self.vofa_port, "text_port": self.vofa_text_port,
+                         "jf_clients": len(self.jf_clients), "text_clients": len(self.vofa_clients)}}
+
+    async def _announce_vofa(self):
+        try:
+            await self.broadcast({"type": "vofa_status", **self.vofa_status()["vofa"]})
+        except Exception:
+            pass
+
+    async def _vofa_autoconnect(self):
+        try:
+            await _auto_connect_openocd_task(self, None, wait_s=3.0)
+        finally:
+            self._autoconn_busy = False
 
     JF_MAX_PENDING = 512 * 1024   # 单个 VOFA+ 客户端发送积压上限, 超出视为卡死并断开, 避免拖慢网页波形
     JF_DROP_WATERMARK = 4096      # VOFA+ UI 渲染慢于接收速率时跳过整批帧, 防止 TCP 缓冲积压出几秒延迟
@@ -1462,6 +1588,13 @@ class AppServer:
     async def _serve_vofa(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, pool: set):
         _set_tcp_nodelay(writer, sndbuf=8192)
         pool.add(writer)
+        await self._announce_vofa()
+        # VOFA+ 先于网页接入时, 网关还没连目标 → 转发没有数据源 (表现为\"转发没用\")。
+        # 若本机 OpenOCD (19021) 已在运行且用户没有主动断开过, 自动建立连接。
+        if (not self.rtt.connected and not self.rtt.user_disconnected and not self._autoconn_busy
+                and _is_port_open("127.0.0.1", 19021, timeout=0.2)):
+            self._autoconn_busy = True
+            asyncio.create_task(self._vofa_autoconnect())
         try:
             while True:
                 data = await reader.read(1024)
@@ -1480,6 +1613,7 @@ class AppServer:
                 await writer.wait_closed()
             except Exception:
                 pass
+            await self._announce_vofa()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -1627,6 +1761,7 @@ class AppServer:
                     await self.rtt.send_rtt("$GET:ALL\n")
 
             elif action == "disconnect":
+                self.rtt.user_disconnected = True
                 await self.rtt.disconnect()
                 await self.broadcast({
                     "type": "connect_result",
@@ -1679,7 +1814,7 @@ def _get_lan_ip() -> str:
         return "127.0.0.1"
 
 
-async def _auto_connect_openocd_task(server: AppServer, chip_id: str):
+async def _auto_connect_openocd_task(server: AppServer, chip_id: Optional[str], wait_s: float = 45.0):
     """当通过一键启动全套 (--openocd) 拉起服务，或启动时检测到 19021 已有 OpenOCD 时，
     在后台等待 19021 端口就绪并自动建立连接，使浏览器打开即处于【已连接】状态。"""
     chips = load_chips()
@@ -1687,12 +1822,14 @@ async def _auto_connect_openocd_task(server: AppServer, chip_id: str):
         "id": "h723", "part": "STM32H723VG", "openocd_target": "stm32h7x", "ram_base": "0x24000000"
     }
     t0 = time.monotonic()
-    while time.monotonic() - t0 < 8.0:
+    # 等待时间由 8s 放宽到 45s: 一键启动全套里 openocd_rtt.py 先做 USB 探测 (Windows 11 的 PowerShell WMI 可能要数秒),
+    # 再依次尝试 cmsis-dap / wch / stlink, ST-Link 往往排在最后, 8s 内 19021 常常还没监听 → 自动连接静默放弃。
+    while time.monotonic() - t0 < wait_s:
         if server.rtt.connected:
             return
         if _is_port_open("127.0.0.1", 19021, timeout=0.25):
             ok, msg = await server.rtt.connect(
-                mode="daplink",
+                mode="auto",   # 不再写死 daplink: 实际调试器以已运行的 OpenOCD 为准
                 target=prof["part"],
                 speed=1000,
                 host="127.0.0.1",
@@ -1713,6 +1850,14 @@ async def _auto_connect_openocd_task(server: AppServer, chip_id: str):
                 await server.rtt.send_rtt("$GET:ALL\n")
             return
         await asyncio.sleep(0.4)
+    if wait_s >= 20.0 and not server.rtt.connected:
+        await server.broadcast({
+            "type": "connect_result",
+            "success": False,
+            "message": (f"{int(wait_s)} 秒内没有检测到 OpenOCD RTT 端口 (127.0.0.1:19021)。请查看 OpenOCD 黑色窗口的报错 "
+                        "(调试器未识别 / 被 Keil 占用 / 目标未上电), 或在网页选择调试器类型后手动点击【连接目标】"),
+            "status": server.rtt.get_status(),
+        })
 
 
 async def main(allow_lan: bool = False, auto_openocd_chip: Optional[str] = None):

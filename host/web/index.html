@@ -31,11 +31,12 @@
     <div class="connection-bar">
       <div class="conn-inputs">
         <select id="conn-mode" class="custom-select" title="选择连接方式">
+          <option value="auto" selected>🔌 自动识别 (ST-Link / DAP-Link / WCH-Link)</option>
           <option value="mock">🎮 仿真模拟模式 (Mock)</option>
-          <option value="daplink" selected>🔗 DAP-Link 模式 (OpenOCD)</option>
+          <option value="daplink">🔗 DAP-Link 模式 (OpenOCD)</option>
           <option value="stlink">🔗 ST-Link 模式 (OpenOCD)</option>
           <option value="pylink">⚡ J-Link 直连模式 (SWD)</option>
-          <option value="telnet">🌐 Telnet 转发模式 (19021)</option>
+          <option value="telnet">🌐 TCP 直连 RTT 端口 (已运行的 OpenOCD / J-Link)</option>
         </select>
 
         <select id="chip-preset" class="custom-select" title="快速选择芯片型号">
@@ -83,9 +84,9 @@
         <span id="latency-val">-- ms</span>
       </div>
 
-      <div class="vofa-badge" title="VOFA+ TCP 波形接口已就绪 (FireWater 协议)">
+      <div id="vofa-badge" class="vofa-badge" title="VOFA+ 请新建 TCP 客户端: JustFloat 协议连 127.0.0.1:1347 (多通道波形); FireWater 文本协议连 127.0.0.1:1348 (仅 $DATA 遥测)。也可直连 OpenOCD 19022。">
         <span class="vofa-icon">📈</span>
-        <span class="vofa-text">VOFA+ :1347</span>
+        <span id="vofa-text" class="vofa-text">VOFA+ :1347</span>
       </div>
 
       <button id="btn-ping" class="btn btn-secondary btn-icon-only" title="测试往返心跳 Ping">

@@ -573,7 +573,7 @@
           ctx.setLineDash([]);
         }
       } else {
-        // 分通道缩放 (多通道各自铺满): 等分 4 格, 数值见图例/十字光标
+        // 各自归一化 (非默认): 等分 4 格, 数值见图例/十字光标; 幅值比例不真实, 故在轴上明确标注
         ctx.beginPath();
         ctx.strokeStyle = THEME.grid;
         for (let k = 1; k < 4; k++) {
@@ -586,7 +586,7 @@
         ctx.rotate(-Math.PI / 2);
         ctx.textAlign = 'center';
         ctx.fillStyle = THEME.textDim;
-        ctx.fillText('分通道缩放', 0, 0);
+        ctx.fillText('各自归一化 (幅值不按真实比例)', 0, 0);
         ctx.restore();
       }
     }

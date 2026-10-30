@@ -757,6 +757,66 @@ except (OSError, ValueError):
 
 ---
 
+## 2026-10-29 · 第 18 批：多变量低延迟 (VOFA+ 几秒延迟) —— 防积压
+
+- **现象**：VOFA+ 多变量显示滞后数秒。**根因**：(1) 单片机 4 KB 上行缓冲在发送速率超过无线 SWD 读取速率时常驻排满；(2) VOFA+ 渲染慢于接收时 TCP 缓冲积压；(3) OpenOCD 轮询 20 ms。
+- **修复**：`rtt_waveform.c` 增加 `RTT_WAVEFORM_MAX_BACKLOG=1024` 水位门限 (OpenOCD 每次轮询单通道最多读 1024 B)，并新增 `RTT_Send_JustFloat_8Ch/10Ch/12Ch` 与 `RTT_SEND_JUSTFLOAT(...)` 变参宏；
+  网关对 1347/1348/WebSocket/19022 开启 `TCP_NODELAY`，VOFA+ 套接字 `SO_SNDBUF=8 KB` 并在积压 > 4 KB 时整批跳过 (保持帧对齐)；默认轮询 20 → 10 ms。
+- **验证**：STM32H723 + 无线 DAPLink 实测 12 通道全速 (495 帧/s、25.8 KB/s) 端到端响应 46.7 ms，`resync=0`。
+
+---
+
+## 2026-10-30 · 第 19 批（v3.2）：用户反馈四项修复 —— ST-Link 连不上 / 幅值被自动拉伸 / 转发无效 / 以 VOFA+ 为参照
+
+> 来源：同学试用反馈。统一回归：`python TESTs/run_all.py`（含新增 `test_connect_modes.py` 24 项）、
+> `node TESTs/hw/e2e_connect_ui.js`（假 OpenOCD，无需硬件，18 项）。
+
+### FIX-042 ✅ 🔴 使用 ST-Link 时网页连不上，而 OpenOCD 窗口能读到芯片 (`rtt_bridge.py`、`app.js`、`index.html`)
+
+- **现象**：用户用 ST-Link，OpenOCD 窗口读芯片正常，网页却"连接目标"失败；默认选项是 DAP-Link，手动改成 ST-Link 后也没有效果。
+- **根因（逐条排查，均已修复）**：
+  1. 网关自动连接 `_auto_connect_openocd_task` **写死 `mode="daplink"`**，状态栏恒显示 DAP-Link，与实际调试器无关；
+  2. 一键启动全套里 `openocd_rtt.py` 先做 USB 探测 (Win11 的 PowerShell WMI 可能数秒)，并按 cmsis-dap → wch → stlink 顺序依次尝试，**ST-Link 往往排在最后**；
+     而自动连接只等 **8 s**，到期静默放弃 → 页面显示"未连接"；
+  3. 用户此时手动选 ST-Link 点连接：19021 仍未监听 (OpenOCD 窗口还在初始化)，网关**再拉起第二个 OpenOCD 去抢同一个 ST-Link**，两个实例互相抢 USB，
+     窗口里的能读芯片、网关拉起的报 `open failed` —— 即"OpenOCD 能读芯片但连不上"；
+  4. 连接栏下拉框**不记忆**用户选择 (每次刷新回到 DAP-Link)；**已连接时改下拉框没有任何动作**，仍沿用旧连接。
+- **修复**：
+  - 新增 **`自动识别`** 模式并设为默认：先复用已运行的 OpenOCD；否则按实际插入的调试器排序 (ST-Link > WCH-Link > CMSIS-DAP，未检测到的类型作兜底) 依次尝试，成功后状态栏显示实际类型；
+  - 发现系统里已有 `openocd` 进程但 19021 未就绪时，**最多等待 25 s 并复用它，绝不再起第二个**；
+  - 一键启动的自动连接等待 8 s → **45 s**，改用 `auto` 模式；超时给出明确提示 (查看 OpenOCD 窗口报错)；
+  - 网关自拉起 OpenOCD：端口等待 4.5 s → 8 s，两次启动间隔 ≥ 1 s 让调试器 USB 释放，失败提示里列出**检测到的调试器**并指出应选哪种模式；
+  - 网页：下拉框选择写入 `localStorage` (刷新不丢)；**已连接时改选调试器 → 自动断开并按新模式重连**；复用已有 OpenOCD 时状态栏注明"复用已有 OpenOCD"。
+- **验证**：`test_connect_modes.py`（探测顺序、auto/stlink/daplink 复用且不二次拉起、等待启动中的 OpenOCD 后复用）；`e2e_connect_ui.js`（默认 auto、改选 ST-Link 立即生效、刷新后保持、再切 DAP-Link 生效）。
+  ⚠️ 作者环境只有 DAPLink，ST-Link 真机路径依赖上述逻辑与 OpenOCD 命令行 (`stlink.cfg` + `transport select swd`) 的离线校验，**待 ST-Link 用户实测确认**。
+
+### FIX-043 ✅ 🟡 多曲线幅值被自动按比例拉伸 (`app.js`、`wave_core.js`)
+
+- **现象**：叠加显示时，幅值差异很大的曲线（如 ±1 的正弦与 1500 的转速）被各自拉伸到同样高度，看不出真实幅值比例。
+- **根因**：纵轴默认模式为"分通道铺满 (`per`)"——每个通道各自归一化。
+- **修复**：默认改为 **"共用自动 (`auto`)"**：同一子图所有通道共用一个纵轴，幅值按真实比例显示 (与 VOFA+ 一致)；
+  "各自归一化铺满"保留为可选项，并在纵轴上明确标注"幅值不按真实比例"。旧版本已保存的 `per` 一次性迁移为 `auto`（`yModeV=2`，之后用户的显式选择不再被覆盖）。
+  幅值悬殊时用"分图"布局查看各自细节。
+- **验证**：`test_wave_panel.js` 新增 4 项（默认共用同一轴且 `ranges[c] === axis`、per 仍可选、旧设置迁移、显式选择保留）；`e2e_connect_ui.js` 中 1500 与 ±1 同图时 `axis[1] ≥ 1500`。
+
+### FIX-044 ✅ 🟡 "转发"看起来没用 (`rtt_bridge.py`、`app.js`、`index.html`、`style.css`)
+
+- **现象**：用户反馈转发模式似乎无效。
+- **根因**：
+  1. 下拉项 "Telnet 转发模式 (19021)" 名称含糊——其实只是"TCP 直连已运行的 RTT 端口"，DAP/ST-Link/自动模式已自动复用 19021，用户不知道何时该用；
+  2. 顶部徽标 "VOFA+ :1347" 的提示文字还写着 FireWater（1347 早已是 JustFloat，FireWater 在 1348），无法判断转发是否真的生效；
+  3. VOFA+ 先于网页连上 1347 时，网关尚未连目标 → 转发没有数据源，VOFA+ 一片空白。
+- **修复**：改名 **"TCP 直连 RTT 端口 (已运行的 OpenOCD / J-Link)"**；徽标显示实时连接数 (`VOFA+ :1347 · 1 已连接`，有连接时高亮) 并悬停给出 JustFloat/FireWater 两个端口的正确用法；
+  VOFA+ 先接入而本机 OpenOCD(19021) 已运行时，**网关自动建立连接**（用户在网页主动断开过则不再自动重连）；VOFA+ 套接字限制发送缓冲并跳过积压批 (FIX-续，见第 18 批)。
+- **验证**：`test_connect_modes.py`（徽标计数广播、`get_status` 暴露 `vofa`、转发字节一致、VOFA+ 先接入自动连接、主动断开不被静默重连）；`e2e_connect_ui.js`（徽标 `1 已连接` 且高亮、收到的字节为 3 通道对齐 JustFloat 帧）。
+
+### FIX-045 ✅ 🟢 以 VOFA+ 为参照 (第 4 项反馈，按"VOFA+ 可作参考"理解)
+
+- 纵轴行为对齐 VOFA+ (共用刻度、真实幅值，FIX-043)；转发端口与协议说明对齐 VOFA+ TCP 客户端用法 (FIX-044)；
+  `JustFloat → 127.0.0.1:1347`、`FireWater → 127.0.0.1:1348`。若反馈的其他含义 (例如要仿照 VOFA+ 的某个具体功能) 请补充说明。
+
+---
+
 ## 修改记录模板（后续批次参照）
 
 ```markdown

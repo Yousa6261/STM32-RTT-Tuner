@@ -140,16 +140,36 @@
 
   // ================= 连接模式切换 =================
 
+  const CONN_MODE_KEY = 'connMode';
+
+  function applyModeVisibility(mode) {
+    els.pylinkParams.classList.toggle('hidden', mode !== 'pylink');
+    els.telnetParams.classList.toggle('hidden', mode !== 'telnet');
+    if (els.openocdParams) {
+      els.openocdParams.classList.toggle('hidden', mode !== 'stlink' && mode !== 'daplink' && mode !== 'auto');
+    }
+  }
+
   function setupModeSelector() {
+    // 记住用户上次手动选择的调试器类型 (原先每次刷新都回到 DAP-Link, 手动改成 ST-Link 后一刷新又变回去)
+    try {
+      const saved = localStorage.getItem(CONN_MODE_KEY);
+      if (saved && [...els.connMode.options].some(o => o.value === saved)) els.connMode.value = saved;
+    } catch (e) { /* 隐私模式 */ }
+    applyModeVisibility(els.connMode.value);
     els.connMode.addEventListener('change', (e) => {
       const mode = e.target.value;
-      els.pylinkParams.classList.toggle('hidden', mode !== 'pylink');
-      els.telnetParams.classList.toggle('hidden', mode !== 'telnet');
-      if (els.openocdParams) {
-        els.openocdParams.classList.toggle('hidden', mode !== 'stlink' && mode !== 'daplink');
+      try { localStorage.setItem(CONN_MODE_KEY, mode); } catch (err) { /* 隐私模式 */ }
+      applyModeVisibility(mode);
+      // 已连接时改选调试器类型: 自动断开并按新模式重连 (原先改了下拉框没有任何效果, 仍沿用旧连接)
+      if (isConnected) {
+        logTerminal('system', `🔁 连接方式已改为 ${e.target.selectedOptions[0].textContent.trim()}, 正在断开并重新连接...`);
+        reconnectPending = true;
+        sendJson({ type: 'disconnect' });
       }
     });
   }
+  let reconnectPending = false;
 
   // ================= WebSocket 客户端 =================
 
@@ -223,9 +243,18 @@
           }
           break;
 
+        case 'vofa_status':
+          updateVofaBadge(msg);
+          break;
+
         case 'connect_result':
           logTerminal(msg.success ? 'system' : 'ack-err', msg.message);
           if (msg.status) updateConnectionStatus(msg.status);
+          if (reconnectPending && msg.status && !msg.status.connected) {
+            reconnectPending = false;
+            setTimeout(() => { if (!isConnected) toggleConnect(); }, 500);
+            break;
+          }
           if (msg.success && msg.status && msg.status.connected) waveOnConnected();
           if (msg.success && window.RTTCapturePanel && typeof window.RTTCapturePanel.onConnected === 'function') {
             window.RTTCapturePanel.onConnected();
@@ -330,17 +359,37 @@
   }
 
   function updateConnectionStatus(status) {
+    if (status.vofa) updateVofaBadge(status.vofa);
     if (status.connected) {
       const modeNames = {
         mock: '仿真模拟',
         pylink: `J-Link (${status.target})`,
-        telnet: `Telnet (${status.host}:${status.port})`,
+        telnet: `TCP 直连 (${status.host}:${status.port})`,
         stlink: `ST-Link (${status.openocd_target || 'OpenOCD'})`,
-        daplink: `DAP-Link (${status.openocd_target || 'OpenOCD'})`
+        daplink: `DAP-Link (${status.openocd_target || 'OpenOCD'})`,
+        auto: `OpenOCD (${status.openocd_target || 'auto'})`
       };
-      setConnectionState(true, modeNames[status.mode] || '已连接');
+      const base = modeNames[status.mode] || '已连接';
+      setConnectionState(true, status.reused ? `${base} · 复用已有 OpenOCD` : base);
+      // 网关自动连接 (一键启动全套) 时, 下拉框与实际连接保持一致, 避免显示 DAP-Link 而实际是 ST-Link
+      if (status.mode === 'auto' && els.connMode.value !== 'auto') { els.connMode.value = 'auto'; applyModeVisibility('auto'); }
     } else {
       setConnectionState(false, '未连接');
+    }
+  }
+
+  // VOFA+ 转发端口徽标: 显示两个端口与当前连接数, 用来确认转发是否真的生效
+  function updateVofaBadge(v) {
+    const el = document.getElementById('vofa-text');
+    if (!el || !v) return;
+    const jf = Number(v.jf_clients) || 0, tx = Number(v.text_clients) || 0;
+    const n = jf + tx;
+    el.textContent = n > 0 ? `VOFA+ :${v.jf_port} · ${n} 已连接` : `VOFA+ :${v.jf_port}`;
+    const badge = document.getElementById('vofa-badge');
+    if (badge) {
+      badge.classList.toggle('vofa-active', n > 0);
+      badge.title = `VOFA+ 请新建 TCP 客户端:\nJustFloat 协议 → 127.0.0.1:${v.jf_port} (多通道波形, 当前 ${jf} 个连接)\n` +
+        `FireWater 协议 → 127.0.0.1:${v.text_port} (仅 $DATA 遥测, 当前 ${tx} 个连接)\n也可直连 OpenOCD 127.0.0.1:19022。`;
     }
   }
 
@@ -356,7 +405,7 @@
       const ocdRam = els.openocdRam ? (els.openocdRam.value.trim() || '0x24000000') : '0x24000000';
       // 无线 DAPLink 适配: SWD 时钟可选 (原先写死 4000; WCH 无线 DAPLink 实测 4MHz 掉线, 1MHz 稳定)
       const speedSel = document.getElementById('openocd-speed');
-      const ocdSpeed = (speedSel && (mode === 'stlink' || mode === 'daplink'))
+      const ocdSpeed = (speedSel && (mode === 'stlink' || mode === 'daplink' || mode === 'auto'))
         ? (parseInt(speedSel.value, 10) || 4000) : 4000;
 
       els.statusLed.className = 'status-led connecting';
@@ -1205,7 +1254,7 @@
   const WAVE_HISTORY_PRESETS = [10, 30, 60, 120, 300];
   const WAVE_WINDOW_PRESETS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60];
   const WAVE_DEFAULTS = {
-    xMode: 'time', windowSec: 2, points: 2000, historySec: 60,
+    yModeV: 2, xMode: 'time', windowSec: 2, points: 2000, historySec: 60,
     layout: 'overlay', groups: [], yCfg: {}, fpsCap: 60, transport: 'auto',
     markers: true, clearOnConnect: false, smooth: true, wide: false, height: 0
   };
@@ -1242,14 +1291,18 @@
     try { s = JSON.parse(localStorage.getItem(WAVE_SETTINGS_KEY) || '{}') || {}; } catch (e) { s = {}; }
     const d = WAVE_DEFAULTS;
     const yCfg = {};
+    // v3.2: 纵轴默认改为"共用自动" (各通道同一刻度, 真实幅值比例, 与 VOFA+ 一致)。
+    // 旧版本默认的"分通道铺满"会把不同幅值的曲线各自拉伸到同样高度, 误导用户; 旧设置里的 'per' 一次性迁移为 'auto'。
+    const legacyY = !(s.yModeV >= 2);
     if (s.yCfg && typeof s.yCfg === 'object') {
       Object.keys(s.yCfg).forEach(k => {
         const c = s.yCfg[k] || {};
-        yCfg[k] = { mode: ['per', 'auto', 'manual', 'sym'].includes(c.mode) ? c.mode : 'per',
+        yCfg[k] = { mode: ['per', 'auto', 'manual', 'sym'].includes(c.mode) && !(legacyY && c.mode === 'per') ? c.mode : 'auto',
                     min: Number(c.min) || 0, max: Number(c.max) || 0, sym: Math.abs(Number(c.sym) || 0) };
       });
     }
     return {
+      yModeV: 2,
       xMode: s.xMode === 'points' ? 'points' : 'time',
       windowSec: clampNum(s.windowSec, 0.01, 3600, d.windowSec),
       points: Math.round(clampNum(s.points, 10, 5e6, d.points)),
@@ -1760,7 +1813,7 @@
   function yCfgOf(gid) {
     const c = wave.settings.yCfg[gid] || {};
     return {
-      mode: ['per', 'auto', 'manual', 'sym'].includes(c.mode) ? c.mode : 'per',
+      mode: ['per', 'auto', 'manual', 'sym'].includes(c.mode) ? c.mode : 'auto',
       min: Number(c.min) || 0, max: Number(c.max) || 0, sym: Math.abs(Number(c.sym) || 0)
     };
   }
@@ -1817,7 +1870,7 @@
         p.axis = r;
         p.chans.forEach(c => { p.ranges[c] = r; });
       } else {
-        // 分通道铺满: 量纲差别大时 (如 ±1 的正弦与 1500 的转速) 小幅值通道不会被压成直线
+        // 各自归一化铺满 (非默认; 幅值比例不真实): 量纲差别大时 (如 ±1 的正弦与 1500 的转速) 小幅值通道不会被压成直线
         for (const c of p.chans) {
           const base = stableRange(`${p.id}:${c}`, per[c][0], per[c][1]);
           if (base) p.ranges[c] = WC.applyYView(base, yv.zoom, yv.pan);
@@ -2539,14 +2592,14 @@
           Object.keys(wave.yState).forEach(key => { if (key.split(':')[0] === String(gp.id)) delete wave.yState[key]; });
           apply(true);
         };
-        const ctrls = [sel([['per', '分通道铺满'], ['auto', '共用自动'], ['manual', '手动范围'], ['sym', '对称 ±N']], cfg.mode, v => {
+        const ctrls = [sel([['auto', '共用自动 (真实幅值)'], ['per', '各自归一化铺满'], ['manual', '手动范围'], ['sym', '对称 ±N']], cfg.mode, v => {
           const patch = { mode: v };
           if (v === 'manual' && !(cfg.max > cfg.min)) {
             const r = (wave.plots[k] && wave.plots[k].axis) || [-1, 1];
             patch.min = Number(r[0].toPrecision(4)); patch.max = Number(r[1].toPrecision(4));
           }
           setCfg(patch);
-        }, '分通道铺满: 每个通道按自身范围铺满 (量纲差异大时用); 共用自动: 同组通道共用一个自动纵轴')];
+        }, '共用自动: 同图通道共用一个纵轴, 幅值大小按真实比例显示 (默认, 同 VOFA+); 各自归一化: 每个通道各自拉伸铺满, 仅看波形形状, 幅值比例不真实')];
         if (cfg.mode === 'manual') {
           ctrls.push(num(cfg.min, -1e12, 1e12, 'any', v => setCfg({ min: v }), '下限'), hint('~'),
             num(cfg.max, -1e12, 1e12, 'any', v => setCfg({ max: v }), '上限'));

@@ -258,7 +258,14 @@ m.setWaveVisible(2, true);
 m.setWaveLayout('overlay');
 W.settings.yCfg = {};
 render();
-check('overlay: per-channel scaling (no shared numeric axis) by default', W.plots.length === 1 && W.plots[0].axis === null && Object.keys(W.plots[0].ranges).length === 3);
+check('overlay: default = ONE shared axis, true amplitude ratios (VOFA+ style, not per-channel normalised)',
+  W.plots.length === 1 && Array.isArray(W.plots[0].axis) && Object.keys(W.plots[0].ranges).length === 3 &&
+  [0, 1, 2].every(c => W.plots[0].ranges[c] === W.plots[0].axis));
+W.settings.yCfg = { 1: { mode: 'per' } };
+W.yState = {}; W.dirty = true; render();
+check('overlay: per-channel normalise still selectable (axis=null, per-channel ranges)', W.plots[0].axis === null && Object.keys(W.plots[0].ranges).length === 3);
+W.settings.yCfg = {};
+W.yState = {}; W.dirty = true; render();
 
 // ------------------------------------------------------------------ 7. ACK markers
 m.waveOnAck({ type: 'ack', success: true, param: 'pid_kp', val: '1.0000' });
@@ -390,7 +397,13 @@ const reloaded = m.loadWaveSettings();
 check('settings persisted to localStorage and reloaded', reloaded.transport === 'auto' && reloaded.historySec === 60 && reloaded.layout === 'overlay');
 store.ch1WaveSettings = JSON.stringify({ windowSec: 'abc', layout: 'evil', fpsCap: 999, groups: [0, 99, 'x'], yCfg: { 1: { mode: 'hack', min: 'NaN' } } });
 const sane = m.loadWaveSettings();
-check('corrupt settings sanitized', sane.windowSec === 2 && sane.layout === 'overlay' && sane.fpsCap === 60 && sane.groups.join() === '1,8,1' && sane.yCfg[1].mode === 'per', sane);
+check('corrupt settings sanitized', sane.windowSec === 2 && sane.layout === 'overlay' && sane.fpsCap === 60 && sane.groups.join() === '1,8,1' && sane.yCfg[1].mode === 'auto', sane);
+store.ch1WaveSettings = JSON.stringify({ yCfg: { 0: { mode: 'per' }, 1: { mode: 'manual', min: 0, max: 5 } } });
+const mig = m.loadWaveSettings();
+check('legacy per-channel default migrated to shared auto (once), manual kept', mig.yCfg[0].mode === 'auto' && mig.yCfg[1].mode === 'manual' && mig.yModeV === 2, mig);
+store.ch1WaveSettings = JSON.stringify({ yModeV: 2, yCfg: { 0: { mode: 'per' } } });
+check('explicit per-channel choice kept once migrated', m.loadWaveSettings().yCfg[0].mode === 'per');
+store.ch1WaveSettings = JSON.stringify(reloaded);
 nodes['btn-wave-wide'].fire('click');
 check('wide: card moved before capture card and spans both columns', nodes['wave-card'].parentNode === main && main.children.indexOf(nodes['wave-card']) === main.children.indexOf(nodes['capture-card']) - 1 && nodes['wave-card'].classList.contains('wave-wide'));
 nodes['btn-wave-wide'].fire('click');

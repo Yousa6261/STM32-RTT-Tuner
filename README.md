@@ -48,7 +48,8 @@ python host\server\run.py
 1. 终端里看 `[ACK 收到]`/`参数列表同步完成 (共 N 个)` 或红色告警：参数徽标显示 `已同步 M/N 项 ⚠` 说明列表不完整。
 2. **用本仓库 `firmware/rtt_core/` 里的 `rtt_param_parser.c/.h`、`SEGGER_RTT/SEGGER_RTT_Conf.h` 覆盖你工程里的旧版并重新编译烧录**（v3.2 起 `$GET:ALL` 分批输出，旧版注册约 15~20 个以上变量就会溢出 Ch0 缓冲而丢失，`RTT_Send_Telemetry` 超长也会被丢）。
 3. 告警写"固件没有响应 `$GET:ALL`"：检查固件是否调用了 `RTT_Param_Init()`，主循环里是否持续调用 `RTT_Param_Poll()`，变量是否用 `RTT_REGISTER_FLOAT/INT/UINT/BOOL` 注册。
-4. 名字与内置控件同名 (`pid_kp`/`pid_ki`/`pid_kd`/`target_speed`/`max_current`/`work_mode`/`motor_en`) 的变量显示在上方专属面板，其余显示在「单片机动态自注册参数表」。
+4. 告警写"可能原因：检测到 Keil ... 正在运行 / SWD 链路读取失败 / 目标处于暂停状态"：**Keil 与网页（OpenOCD）不能同时占用同一个 ST-Link**，Keil 只用来编译下载，下载完点 Stop 退出调试（或关闭 Keil），再点网页【连接目标】。
+5. 名字与内置控件同名 (`pid_kp`/`pid_ki`/`pid_kd`/`target_speed`/`max_current`/`work_mode`/`motor_en`) 的变量显示在上方专属面板，其余显示在「单片机动态自注册参数表」。
 
 ## 运行自动化测试
 

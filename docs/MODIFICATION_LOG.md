@@ -847,6 +847,21 @@ except (OSError, ValueError):
   3 秒内没有 `LIST_END` 也告警 (区分"固件未响应，请检查 RTT_Param_Init / RTT_Param_Poll / 注册"与"列表不完整")。网页参数徽标变红显示 `已同步 M/N 项 ⚠`，终端给出原因与处理办法。
 - **验证**：`TESTs/test_param_sync.py` 12 项；`e2e_connect_ui.js` 新增 2 项 (固件无应答时徽标告警 + 终端提示)。
 
+### FIX-049 ✅ 🔴 "固件没有响应 $GET:ALL"：Keil 与 OpenOCD 同时占用 ST-Link (`rtt_bridge.py`)
+
+- **现象**：用户用 ST-Link，Keil5 能读到芯片 UID，网页却提示"固件没有响应 $GET:ALL"。
+- **取证**：此时用户的 OpenOCD (4000 kHz) 状态为 `cpu0 = unknown`，`mdw` / `rtt channels` 全部报 `Fail reading CTRL/STAT register. Force reconnect`，
+  同一时刻 Keil (`UV4.exe`) 正在运行。随后在无 Keil 的干净环境里对比 4000 kHz 与 1000 kHz：两者都稳定 (11 个变量 + `LIST_END`，无任何 CTRL/STAT 错误)。
+  结论：**不是 SWD 时钟、也不是固件代码，而是 Keil 的调试会话与 OpenOCD 同时占用同一个 ST-Link / 目标** (Keil 调试还会把 CPU 停住)，链路被互相打断。
+- **修复**：
+  - 连接成功后立即检测 Keil / STM32CubeProgrammer / ST-LINK_gdbserver / J-Link 等进程，发现就在终端醒目提示；
+  - "固件没有响应"告警前自动诊断并**把真正原因放在最前面**：有哪些工具占用调试器、OpenOCD 报告 SWD 链路读取失败、目标被停住 (halted) / 状态未知 (unknown)，再附代码自查清单；
+  - 网关自行拉起的 OpenOCD 输出改为后台线程持续读取 (旧实现开了管道却从不读，日志写满 64 KB 后 OpenOCD 会被阻塞)，并保留最近 200 行用于诊断。
+- **验证**：真机 (ST-Link V2.1 + STM32H7) 上 `halt` / `resume` 时诊断依次得到 `halted` / `running`；`test_param_sync.py` 新增 3 项 (Keil+链路断、CPU 暂停、无异常时不给误导性建议)；
+  烧录 v3.2 固件后真机浏览器 E2E `--mode auto` 35/35。
+- **使用要点**：Keil 只用来**编译 + 下载**，下载完点 Stop 退出调试 (或关闭 Keil)，再用网页连接；不要同时开着 Keil 调试会话。
+  **绝不要用强杀的方式结束 OpenOCD** (会让 ST-Link 的 USB 状态错乱，需要拔插恢复)，应在 4444 端口发 `shutdown`。
+
 **⚠ 使用者须知**：固件侧修复在 `firmware/rtt_core/`。**用户自己工程里的 `rtt_param_parser.c/.h` 与 `SEGGER_RTT_Conf.h` 必须用本仓库版本覆盖并重新编译烧录**，否则只有网页侧的告警，变量仍会丢。
 
 ---

@@ -103,10 +103,31 @@ async def main():
     check("LIST_END never arrives: watchdog warns with the received count", len(w) == 1 and w[0]["received"] == 5 and w[0]["expected"] is None, w)
 
     # 5) firmware silent -> distinct hint about RTT_Param_Init / Poll
-    msgs, n = await run_scenario(lambda k: b"", wait_s=1.4, watchdog=0.5)
+    msgs, n = await run_scenario(lambda k: b"", wait_s=3.5, watchdog=0.5)
     w = warns(msgs)
     check("firmware silent: hint to call RTT_Param_Init()/RTT_Param_Poll() and register variables",
           len(w) == 1 and w[0]["received"] == 0 and "RTT_Param_Poll" in w[0]["message"], w)
+
+    # 5b) silent firmware + Keil holding the ST-Link / CPU halted -> the warning names the real cause first
+    orig_diag = rtt_bridge.diagnose_link
+    rtt_bridge.diagnose_link = lambda *a, **k: {"tools": ["Keil uVision (UV4.exe)"], "state": "unknown", "link_fail": True}
+    try:
+        msgs, n = await run_scenario(lambda k: b"", wait_s=1.6, watchdog=0.5)
+    finally:
+        rtt_bridge.diagnose_link = orig_diag
+    w = warns(msgs)
+    check("silent firmware: warning leads with the probable cause (Keil running / SWD link dead) before the code checklist",
+          len(w) == 1 and w[0]["message"].startswith("【可能原因】") and "Keil" in w[0]["message"] and "Fail reading CTRL/STAT" in w[0]["message"]
+          and "RTT_Param_Poll" in w[0]["message"], w)
+    rtt_bridge.diagnose_link = lambda *a, **k: {"tools": [], "state": "halted", "link_fail": False}
+    try:
+        msgs, n = await run_scenario(lambda k: b"", wait_s=1.6, watchdog=0.5)
+    finally:
+        rtt_bridge.diagnose_link = orig_diag
+    w = warns(msgs)
+    check("silent firmware: CPU halted by a debugger is called out", len(w) == 1 and "暂停" in w[0]["message"], w)
+    fd = rtt_bridge.format_link_diag
+    check("diagnosis text: nothing wrong detected -> empty (no misleading advice)", fd({"tools": [], "state": "running", "link_fail": False}) == "")
 
     # 6) inf / nan ranges: must be valid JSON for the browser
     lines = (param_line(0, "-inf", "inf", "inf_range") + param_line(1, "nan", "nan", "nan_range") +

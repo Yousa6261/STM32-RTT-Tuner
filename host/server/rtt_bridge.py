@@ -114,6 +114,76 @@ def _openocd_process_running() -> bool:
         return False
 
 
+# 会与 OpenOCD 争抢同一个调试器 / 把 CPU 停住的常见工具 (进程名 -> 显示名)
+_COMPETING_TOOLS = {
+    "uv4.exe": "Keil uVision (UV4.exe)",
+    "stm32cubeprogrammer.exe": "STM32CubeProgrammer",
+    "stm32_programmer_cli.exe": "STM32_Programmer_CLI",
+    "st-link_gdbserver.exe": "ST-LINK_gdbserver",
+    "jlink.exe": "J-Link Commander",
+    "jlinkgdbserver.exe": "J-Link GDB Server",
+    "jlinkgdbservercl.exe": "J-Link GDB Server",
+    "stm32cubeide.exe": "STM32CubeIDE",
+}
+
+
+def competing_tools() -> list:
+    """当前正在运行、会与 OpenOCD 争抢调试器的工具 (仅 Windows; 同步调用, 约 0.1~0.5 s)"""
+    tools = []
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["tasklist", "/NH", "/FO", "CSV"], capture_output=True, text=True, timeout=6,
+                                 errors="replace").stdout.lower()
+            for exe, label in _COMPETING_TOOLS.items():
+                if f'"{exe}"' in out and label not in tools:
+                    tools.append(label)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return tools
+
+
+def diagnose_link(telnet_port: int = 4444) -> dict:
+    """同步 (须在线程中调用): 检查 \"为什么固件没有响应\" —— 是否有别的调试工具在占用调试器, OpenOCD 看到的目标状态。
+    返回 {"tools": [...], "state": "running|halted|unknown|None", "link_fail": bool}"""
+    tools = competing_tools()
+    state, link_fail = None, False
+    try:
+        with socket.create_connection(("127.0.0.1", telnet_port), timeout=1.0) as s:
+            s.settimeout(1.5)
+            try:
+                s.recv(2048)
+            except OSError:
+                pass
+            s.sendall(b"targets\n")
+            time.sleep(0.8)
+            txt = s.recv(8192).decode("ascii", "ignore").lower()
+            link_fail = "fail reading ctrl/stat" in txt
+            for line in txt.splitlines():
+                if "cortex_m" in line:
+                    for st in ("halted", "running", "unknown", "reset", "debug-running"):
+                        if st in line:
+                            state = st
+                            break
+    except OSError:
+        pass
+    return {"tools": tools, "state": state, "link_fail": link_fail}
+
+
+def format_link_diag(d: dict) -> str:
+    parts = []
+    if d.get("tools"):
+        parts.append("检测到 " + "、".join(d["tools"]) + " 正在运行 —— 它们与 OpenOCD **不能同时占用同一个 ST-Link / 调试器** "
+                     "(Keil 的调试会话还会把 CPU 停住)。请在 Keil 里点 Stop 退出调试 (只用它编译烧录即可) 或直接关闭这些工具, 然后在网页重新点【连接目标】")
+    if d.get("link_fail"):
+        parts.append("OpenOCD 报告 SWD 链路读取失败 (Fail reading CTRL/STAT): 调试器与芯片之间的通信已中断, "
+                     "请关闭抢占调试器的软件、拔插调试器后重连, 并把 SWD 时钟降到 1MHz")
+    elif d.get("state") in ("halted", "debug-running"):
+        parts.append("OpenOCD 看到目标处于【暂停】状态: CPU 被调试器/断点停住, 固件没有在运行。请让程序运行 (Keil 里点 Run, 或复位后不要进入调试)")
+    elif d.get("state") == "unknown":
+        parts.append("OpenOCD 无法确定目标状态 (unknown): SWD 链路不稳定或被别的工具占用")
+    return "；".join(parts)
+
+
 # 连接参数校验 (v3 P0 安全修复): openocd_target / openocd_ram 会被拼进 OpenOCD 的 Tcl 命令 (-c "..."),
 # 未校验时可注入任意 Tcl 语句。只接受下列格式。
 RE_OCD_TARGET = re.compile(r"^[a-z0-9_]{2,32}$")
@@ -635,6 +705,8 @@ class RTTManager:
         self.pending_sends: Dict[str, float] = {}
         self._plist = None                   # 最近一次 $GET:ALL 的接收进度 (参数列表完整性检查)
         self._plist_retrying = False
+        self.ocd_log = deque(maxlen=200)     # 自行拉起的 OpenOCD 最近输出
+        self._ocd_drain = None
         self.reused = False                  # 本次连接复用了已运行的 OpenOCD (19021)
         self.user_disconnected = False       # 用户在网页上主动断开过: 此后不再因 VOFA+ 接入而自动重连
         self.status_extra = None             # AppServer 注入: () -> dict (VOFA+ 客户端数等)
@@ -917,6 +989,21 @@ class RTTManager:
             return f"芯片 id 格式不合法: {chip!r}"
         return None
 
+    def _start_ocd_drain(self, proc):
+        """持续读取自行拉起的 OpenOCD 输出。旧实现只开了管道却从不读取: OpenOCD 日志写满 64 KB 管道缓冲后会被阻塞 (整个 RTT 服务卡死),
+        长时间运行或链路反复报错时必现。这里用后台线程读走并只保留最近 200 行供诊断。"""
+        self.ocd_log = deque(maxlen=200)
+
+        def pump():
+            try:
+                for raw in iter(proc.stdout.readline, b""):
+                    self.ocd_log.append(raw.decode("utf-8", "replace").rstrip())
+            except (OSError, ValueError):
+                pass
+        import threading
+        self._ocd_drain = threading.Thread(target=pump, name="openocd-log", daemon=True)
+        self._ocd_drain.start()
+
     async def _try_reuse_openocd(self, mode: str):
         """19021 已有 OpenOCD 在监听 → 直接复用 (返回 (ok, msg)); 端口未监听返回 None。"""
         if not _is_port_open("127.0.0.1", 19021, timeout=0.5):
@@ -1074,6 +1161,7 @@ class RTTManager:
                         stderr=subprocess.STDOUT,
                         startupinfo=startupinfo
                     )
+                    self._start_ocd_drain(self.openocd_proc)
                 except FileNotFoundError:
                     return False, "未找到 openocd 命令，请确保已安装 OpenOCD 并将其 bin 路径添加到环境变量 PATH 中。"
                 except Exception as e:
@@ -1098,7 +1186,10 @@ class RTTManager:
                 try:
                     if self.openocd_proc.poll() is None:
                         self.openocd_proc.terminate()
-                    out, _ = self.openocd_proc.communicate(timeout=1.5)
+                    self.openocd_proc.wait(timeout=1.5)
+                    if self._ocd_drain is not None:
+                        self._ocd_drain.join(timeout=1.0)
+                    out = "\n".join(self.ocd_log).encode("utf-8", "replace")
                 except Exception:
                     pass
                 self.openocd_proc = None
@@ -1436,6 +1527,13 @@ class RTTManager:
         if expected is None and got == 0:
             msg = ("固件没有响应 $GET:ALL: 请确认固件已调用 RTT_Param_Init() / RTT_Param_Poll() (主循环里要持续调用), "
                    "且变量已用 RTT_REGISTER_xxx 注册")
+            # 追加自动诊断: 是否有 Keil 等工具占用调试器 / CPU 被停住 / SWD 链路断了 (比固件代码问题更常见)
+            try:
+                diag = format_link_diag(await asyncio.to_thread(diagnose_link))
+            except Exception:
+                diag = ""
+            if diag:
+                msg = f"【可能原因】{diag}。 另外: {msg}"
         else:
             exp = f"固件声明 {expected} 个" if expected is not None else "未收到列表结束标记"
             msg = (f"变量列表不完整: {exp}, 网页只收到 {got} 个。原因通常是 Ch0 上行缓冲 (默认 1024 B) 装不下一次性输出的全部变量行, "
@@ -1817,6 +1915,12 @@ class AppServer:
                 chip = str(chip) if chip not in (None, "", "custom") else None
 
                 ok, msg = await self.rtt.connect(mode, target, speed, host, port, openocd_target, openocd_ram, chip)
+                if ok and mode in ("stlink", "daplink", "auto"):
+                    # 连上之后立刻提醒: Keil 等工具同时开着会抢调试器 / 停住 CPU, 之后表现为\"固件没有响应\"
+                    tools = await asyncio.to_thread(competing_tools)
+                    if tools:
+                        msg += (f" ⚠ 检测到 {'、'.join(tools)} 正在运行: 它与 OpenOCD 不能同时占用同一个调试器 (Keil 调试会话还会停住 CPU), "
+                                "如果参数/波形没有出现, 请先退出这些工具的调试会话")
                 await self.broadcast({
                     "type": "connect_result",
                     "success": ok,
